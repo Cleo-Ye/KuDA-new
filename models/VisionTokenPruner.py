@@ -47,8 +47,11 @@ class TextGuidedVisionPruner(nn.Module):
         T = self.proj_t(hidden_t)  # [B, L_t, 256]
         V = hidden_v  # [B, L_v, 256]
 
-        # 2) 文本权重 w_t = |senti_t| * mask_t
+        # 2) 文本权重 w_t = |senti_t| * mask_t，归一化增强区分度
         w_t = torch.abs(senti_t).float() * mask_t.float()  # [B, L_t], 范围 [0, 3]
+        # 归一化到和为1，使不同样本的权重分布更一致
+        w_t = w_t / (w_t.sum(dim=1, keepdim=True) + 1e-8)
+        w_t = w_t * mask_t.float()  # 重新应用mask确保padding位置为0
 
         # 3) V->T cross-attn, 取注意力权重
         # key_padding_mask: True = padding (mask out)

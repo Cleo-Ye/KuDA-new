@@ -2,6 +2,10 @@
 # ============================================================
 # 完整实验：50 epoch，6 组配置，多 GPU 并行
 #
+# 🔧 Step 1 + Step 2 改进版本
+#   Step 1: VisionTokenPruner 权重归一化 (已完成)
+#   Step 2: ConflictJS 参数优化 (gate_k=8.0, gate_tau=0.12, lambda_js=0.12)
+#
 # 配置（与 quick compare 一致，但跑完整 epoch）:
 #   1. baseline           2. +IEC(r=0.5)    3. +ICR
 #   4. IEC+ICR(r=0.5)     5. IEC+ICR(r=0.3) 6. IEC+ICR(metric=KL)
@@ -31,10 +35,12 @@ fi
 IFS=',' read -ra GPUS <<< "$GPU_IDS"
 N_GPUS=${#GPUS[@]}
 
-# 基础参数 - 所有配置使用原始稳定参数
+# 基础参数 - 使用 Step 1 + Step 2 改进后的默认值
+# Step 1: VisionTokenPruner 归一化 (在代码中)
+# Step 2: gate_k=8.0, gate_tau=0.12, lambda_js=0.12 (在 opts.py 中)
 BASE_ARGS="--datasetName sims --use_cmvn True --use_ki False --n_epochs $N_EPOCHS"
-# 使用原始参数（与快速实验一致，已验证稳定）
-BASE_ARGS="$BASE_ARGS --lambda_nce 0.1 --lambda_senti 0.05 --lambda_js 0.1 --lambda_con 0.1 --lambda_cal 0.1"
+BASE_ARGS="$BASE_ARGS --lambda_nce 0.1 --lambda_senti 0.05 --lambda_con 0.1 --lambda_cal 0.1"
+# 注意: gate_k, gate_tau, lambda_js 现在使用 opts.py 中的新默认值
 
 mkdir -p logs/full_multi
 
