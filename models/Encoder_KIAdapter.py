@@ -5,6 +5,26 @@ from torch.nn import TransformerEncoderLayer, TransformerEncoder
 from transformers import BertConfig, BertModel, BertTokenizer
 
 
+def _sanitize_key_padding_mask(mask, device=None):
+    """
+    防止 key_padding_mask 全 True 导致注意力 softmax(-inf) -> NaN。
+    如果某一行全是 True，则强制保留最后一个位置为 False，确保至少有一个可见 token。
+    """
+    if mask is None:
+        return None
+    if not torch.is_tensor(mask):
+        mask = torch.tensor(mask, device=device)
+    elif device is not None and mask.device != device:
+        mask = mask.to(device)
+    mask = mask.bool()
+    if mask.dim() >= 2 and mask.numel() > 0:
+        all_pad = mask.view(mask.size(0), -1).all(dim=1)
+        if all_pad.any():
+            mask = mask.clone()
+            mask[all_pad, -1] = False
+    return mask
+
+
 class Classifier(nn.Module):
     def __init__(self, input_size, hidden_size, output_size, drop_out):
         super(Classifier, self).__init__()
@@ -59,7 +79,10 @@ class MixDomainAdapter(nn.Module):
 
     def forward(self, ex_know, src_key_padding_mask):
         hidden = self.down_project(ex_know)
-        hidden = self.tfencoder(hidden, mask=None, src_key_padding_mask=src_key_padding_mask)[0]
+        src_key_padding_mask = _sanitize_key_padding_mask(src_key_padding_mask, device=hidden.device)
+        tf_out = self.tfencoder(hidden, mask=None, src_key_padding_mask=src_key_padding_mask)
+        # 兼容不同 PyTorch 环境：标准版返回 Tensor，部分修改版返回 (Tensor, hidden_state_list)
+        hidden = tf_out[0] if isinstance(tf_out, tuple) else tf_out
         domain_know = self.up_project(hidden)
         output = domain_know + ex_know
         return output
@@ -79,15 +102,28 @@ class TfEncoder(nn.Module):
         self.tfencoder = TransformerEncoder(tfencoder_layer, num_layers)
 
     def forward(self, src, src_key_padding_mask):
+        # 手动逐层运行以保留每层隐藏状态（torch.nn.TransformerEncoder 默认只返回最终输出）
+        src_key_padding_mask = _sanitize_key_padding_mask(src_key_padding_mask, device=src.device)
         src = self.pos_encoder(src)
-        output, hidden_list = self.tfencoder(src, mask=None, src_key_padding_mask=src_key_padding_mask)
-        return output, hidden_list
+
+        output = src
+        hidden_state_list = [output]  # 与你截图一致：包含初始输入 + 每层输出
+        for layer in self.tfencoder.layers:
+            output = layer(output, src_mask=None, src_key_padding_mask=src_key_padding_mask)
+            hidden_state_list.append(output)
+
+        if self.tfencoder.norm is not None:
+            output = self.tfencoder.norm(output)
+
+        return output, hidden_state_list
 
 
 class UniEncoder(nn.Module):
-    def __init__(self, m, pretrained, num_patches, fea_size, nhead, dim_feedforward, num_layers):
+    def __init__(self, m, pretrained, num_patches, fea_size, nhead, dim_feedforward, num_layers, hf_cache_dir=None, use_ki=True):
         super(UniEncoder, self).__init__()
         self.m = m
+        self.hf_cache_dir = hf_cache_dir
+        self.use_ki = use_ki
 
         if m in "VA":
             self.tfencoder = TfEncoder(
@@ -98,9 +134,21 @@ class UniEncoder(nn.Module):
                 num_layers=num_layers
             )
         else:
-            self.model_config = BertConfig.from_pretrained(pretrained, output_hidden_states=True)
-            self.tokenizer = BertTokenizer.from_pretrained(pretrained, do_lower_case=True)
-            self.model = BertModel.from_pretrained(pretrained, config=self.model_config)
+            self.model_config = BertConfig.from_pretrained(
+                pretrained,
+                output_hidden_states=True,
+                cache_dir=self.hf_cache_dir
+            )
+            self.tokenizer = BertTokenizer.from_pretrained(
+                pretrained,
+                do_lower_case=True,
+                cache_dir=self.hf_cache_dir
+            )
+            self.model = BertModel.from_pretrained(
+                pretrained,
+                config=self.model_config,
+                cache_dir=self.hf_cache_dir
+            )
             # self.projector = FeatureProjector(fea_size, dim_feedforward)
 
         adapter_layer = MixDomainAdapter(up_prj=dim_feedforward, down_prj=dim_feedforward // 2)
@@ -109,21 +157,25 @@ class UniEncoder(nn.Module):
 
     def forward(self, inputs, key_padding_mask):
         if self.m in "VA":
+            key_padding_mask = _sanitize_key_padding_mask(key_padding_mask, device=inputs.device)
             tf_last_hidden_state, tf_hidden_state_list = self.tfencoder(inputs, src_key_padding_mask=key_padding_mask)
 
             # TransformerEncoder提取的领域知识
             spci_know = self.layernorm(tf_last_hidden_state)
 
-            # Adapter进行知识注入后学习泛知识
-            for n, adapter in enumerate(self.adapters):
-                if n == 0:
-                    data = tf_hidden_state_list[n] + tf_hidden_state_list[n+1]
-                    data = self.layernorm(data)
-                else:
-                    data = data + tf_hidden_state_list[n+1]
-                    data = self.layernorm(data)
-                data = adapter(data, key_padding_mask)
-            domain_know = data
+            if self.use_ki:
+                # Adapter进行知识注入后学习泛知识
+                for n, adapter in enumerate(self.adapters):
+                    if n == 0:
+                        data = tf_hidden_state_list[n] + tf_hidden_state_list[n+1]
+                        data = self.layernorm(data)
+                    else:
+                        data = data + tf_hidden_state_list[n+1]
+                        data = self.layernorm(data)
+                    data = adapter(data, key_padding_mask)
+                domain_know = data
+            else:
+                domain_know = torch.zeros_like(spci_know)
 
             # 对不同知识进行整合
             output = torch.cat([spci_know, domain_know], dim=-1)
@@ -145,21 +197,26 @@ class UniEncoder(nn.Module):
             # spci_know = last_hidden_state[:, 0, :]      # 获得CLS-token信息
 
             # 更新BERT mask矩阵
+            key_padding_mask = []
             for sen in input_mask:
                 mask = [not bool(item) for item in sen]
                 key_padding_mask.append(mask)
-            key_padding_mask = torch.tensor(key_padding_mask).cuda()
+            key_padding_mask = torch.tensor(key_padding_mask, device=inputs.device)
+            key_padding_mask = _sanitize_key_padding_mask(key_padding_mask, device=inputs.device)
 
-            # Adapter学习泛知识     在BERT的 3 6 9 11 层进行操作
-            for n, adapter in zip([3, 6, 9, 11], self.adapters):
-                if n == 3:
-                    data = hidden_state_list[0] + hidden_state_list[n]
-                    data = self.layernorm(data)
-                else:
-                    data = data + hidden_state_list[n]
-                    data = self.layernorm(data)
-                data = adapter(data, key_padding_mask)
-            domain_know = data
+            if self.use_ki:
+                # Adapter学习泛知识     在BERT的 3 6 9 11 层进行操作
+                for n, adapter in zip([3, 6, 9, 11], self.adapters):
+                    if n == 3:
+                        data = hidden_state_list[0] + hidden_state_list[n]
+                        data = self.layernorm(data)
+                    else:
+                        data = data + hidden_state_list[n]
+                        data = self.layernorm(data)
+                    data = adapter(data, key_padding_mask)
+                domain_know = data
+            else:
+                domain_know = torch.zeros_like(spci_know)
 
             # 对不同知识进行整合
             output = torch.cat([spci_know, domain_know], dim=-1)
@@ -173,7 +230,7 @@ class UniEncoder(nn.Module):
 
 
 class UniPretrain(nn.Module):
-    def __init__(self, modality, num_patches, pretrained='./pretrainedModel/BERT/bert-base-uncased', fea_size=709, proj_fea_dim=128, drop_out=0.):
+    def __init__(self, modality, num_patches, pretrained='./pretrainedModel/BERT/bert-base-uncased', fea_size=709, proj_fea_dim=128, drop_out=0., hf_cache_dir=None, use_ki=True):
         super(UniPretrain, self).__init__()
         self.m = modality
         if modality == "T":
@@ -186,7 +243,9 @@ class UniPretrain(nn.Module):
             num_patches=num_patches,
             nhead=8,
             dim_feedforward=proj_fea_dim,
-            num_layers=4
+            num_layers=4,
+            hf_cache_dir=hf_cache_dir,
+            use_ki=use_ki
         )
         self.decoder = Classifier(
             input_size=proj_fea_dim * 2,
@@ -210,15 +269,36 @@ class UniPretrain(nn.Module):
 class UnimodalEncoder(nn.Module):
     def __init__(self, opt, bert_pretrained='./pretrainedModel/BERT/bert-base-uncased'):
         super(UnimodalEncoder, self).__init__()
+        hf_cache_dir = getattr(opt, "hf_cache_dir", None)
+        use_ki = getattr(opt, 'use_ki', True)
         # All Encoders of Each Modality
-        self.enc_t = UniPretrain(modality="T", pretrained=bert_pretrained, num_patches=opt.seq_lens[0], proj_fea_dim=768)
-        self.enc_v = UniPretrain(modality="V", num_patches=opt.seq_lens[1], fea_size=709)
-        self.enc_a = UniPretrain(modality="A", num_patches=opt.seq_lens[2], fea_size=33)
+        fea_dims = getattr(opt, 'fea_dims', [768, 177, 25])  # T, V, A; sims: [768,177,25], mosi/mosei: [768,709,33]
+        self.enc_t = UniPretrain(modality="T", pretrained=bert_pretrained, num_patches=opt.seq_lens[0], proj_fea_dim=768, hf_cache_dir=hf_cache_dir, use_ki=use_ki)
+        self.enc_v = UniPretrain(modality="V", num_patches=opt.seq_lens[1], fea_size=fea_dims[1], use_ki=use_ki)
+        self.enc_a = UniPretrain(modality="A", num_patches=opt.seq_lens[2], fea_size=fea_dims[2], use_ki=use_ki)
+        
+        # Phase 2: 添加情感投影头
+        from models.SentimentProjector import SentimentProjector
+        num_classes = getattr(opt, 'senti_num_classes', 7)
+        # Text: 768*2=1536, Audio/Vision: 128*2=256 (注意默认proj_fea_dim是128不是256)
+        self.senti_proj_t = SentimentProjector(768*2, num_classes)
+        self.senti_proj_v = SentimentProjector(128*2, num_classes)
+        self.senti_proj_a = SentimentProjector(128*2, num_classes)
 
     def forward(self, inputs_data_mask):
         # Encoder Part
         hidden_t, uni_T_pre = self.enc_t(inputs_data_mask)
         hidden_v, uni_V_pre = self.enc_v(inputs_data_mask)
         hidden_a, uni_A_pre = self.enc_a(inputs_data_mask)
+        
+        # Phase 2: 生成情感后验分布
+        posteriors_t, senti_t = self.senti_proj_t(hidden_t)  # [B, L_t, C], [B, L_t]
+        posteriors_v, senti_v = self.senti_proj_v(hidden_v)  # [B, L_v, C], [B, L_v]
+        posteriors_a, senti_a = self.senti_proj_a(hidden_a)  # [B, L_a, C], [B, L_a]
+        
+        posteriors = {'T': posteriors_t, 'V': posteriors_v, 'A': posteriors_a}
+        senti_scores = {'T': senti_t, 'V': senti_v, 'A': senti_a}
 
-        return {'T': hidden_t, 'V': hidden_v, 'A': hidden_a}, {'T': uni_T_pre, 'V': uni_V_pre, 'A': uni_A_pre}
+        return {'T': hidden_t, 'V': hidden_v, 'A': hidden_a}, \
+               {'T': uni_T_pre, 'V': uni_V_pre, 'A': uni_A_pre}, \
+               posteriors, senti_scores

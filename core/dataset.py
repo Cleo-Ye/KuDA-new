@@ -18,7 +18,10 @@ class MMDataset(Dataset):
             'simsv2': self.__init_simsv2,
             'external_knowledge': self.__init_external_knowledge
         }
-        DATA_MAP[args.datasetName]()
+        dataset_key = str(args.datasetName).lower()
+        if dataset_key not in DATA_MAP:
+            raise KeyError(f"Unknown datasetName '{args.datasetName}'. Supported: {list(DATA_MAP.keys())}")
+        DATA_MAP[dataset_key]()
 
     def __init_mosi(self):
         with open(self.args.dataPath, 'rb') as f:
@@ -41,7 +44,7 @@ class MMDataset(Dataset):
         self.labels = {
             'M': data[self.mode][self.args.train_mode+'_labels'].astype(np.float32)
         }
-        if 'sims' in self.args.datasetName:
+        if 'sims' in self.args.datasetName.lower():
             for m in "TAV":
                 self.labels[m] = data[self.mode][self.args.train_mode+'_labels_'+m]
 
@@ -52,6 +55,10 @@ class MMDataset(Dataset):
         # Clear dirty data
         self.audio[self.audio == -np.inf] = 0
         self.vision[self.vision == -np.inf] = 0
+        
+        # Phase 1: 添加音频CMVN(Cepstral Mean and Variance Normalization)
+        if self.args.use_cmvn:
+            self._apply_audio_cmvn()
 
         self.__gen_mask(data[self.mode])
         if self.args.need_truncated:
@@ -153,6 +160,23 @@ class MMDataset(Dataset):
 
     def __len__(self):
         return len(self.labels['M'])
+    
+    def _apply_audio_cmvn(self):
+        """
+        Phase 1: 对音频特征应用CMVN(Cepstral Mean and Variance Normalization)
+        对每条样本的有效音频长度做z-score归一化
+        """
+        for i in range(len(self.audio)):
+            valid_len = self.audio_lengths[i]
+            if valid_len > 0:
+                audio_valid = self.audio[i, :valid_len, :]  # 只处理有效部分
+                
+                # 计算均值和标准差
+                mean = audio_valid.mean(axis=0, keepdims=True)  # [1, feat_dim]
+                std = audio_valid.std(axis=0, keepdims=True) + 1e-8  # 避免除零
+                
+                # Z-score归一化
+                self.audio[i, :valid_len, :] = (audio_valid - mean) / std
 
     def __getitem__(self, index):
         sample = {

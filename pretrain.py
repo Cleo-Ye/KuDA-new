@@ -16,7 +16,7 @@ def parse_opts():
     parser.add_argument('--train_mode', type=str, default='regression',
                         help='type of pre-training labels')
 
-    parser.add_argument('--dataPath', type=str, default='/opt/data/private/Project/Datasets/MSA_Datasets/SIMSv2/SIMSv2s/Processed/unaligned.pkl',
+    parser.add_argument('--dataPath', type=str, default='/18T/yechenlu/MSA_datasets/SIMS-v2/ch-sims2s/unaligned.pkl',
                         help='path for checkpointing, changing the path based on the pre-trained dataset')
     parser.add_argument('--savePath', type=str, default='./pretrainedModel/KnowledgeInjectPretraining/',
                         help='path for checkpointing')
