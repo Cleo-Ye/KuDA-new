@@ -31,16 +31,21 @@ def _collect_all_stats(model, dataloader, device):
             'seq_lens': {'T'/'A'/'V': int} sequence lengths per modality
             'vision_orig_len': int, original vision length before pruning
             'vision_pruned_len': int, vision length after pruning
-            'samples': list of per-sample dicts (for case study)
+            'gate_weights': [N,] conf_weight (门控 α vs C 可视化)
+            'gate_alpha': {'T'/'A'/'V': [N,]} per-modality gate alpha
+            'samples': list of per-sample dicts (for case study + alignment heatmap)
     """
     model.eval()
     stats = {
         'C': [], 'C_m': {'T': [], 'A': [], 'V': []},
         'preds': [], 'labels': [],
+        'modal_labels': {'T': [], 'A': [], 'V': []},   # 模态级 GT 标签，用于 C-vs-disagreement
         'con_counts': {'T': [], 'A': [], 'V': []},
         'conf_counts': {'T': [], 'A': [], 'V': []},
         'seq_lens': {},
         'vision_orig_len': 0, 'vision_pruned_len': 0,
+        'gate_weights': [],
+        'gate_alpha': {'T': [], 'A': [], 'V': []},
         'samples': [],
     }
 
@@ -62,6 +67,11 @@ def _collect_all_stats(model, dataloader, device):
             stats['preds'].append(pred.cpu().squeeze())
             stats['labels'].append(label.cpu().squeeze())
 
+            # 收集模态级 GT 标签（CH-SIMS 等数据集含 T/A/V 分标签）
+            for m in ['T', 'A', 'V']:
+                if m in data['labels']:
+                    stats['modal_labels'][m].append(data['labels'][m].cpu().squeeze())
+
             if hasattr(model, 'last_conflict_intensity'):
                 stats['C'].append(model.last_conflict_intensity.cpu())
             if hasattr(model, 'last_conflict_intensity_m'):
@@ -77,15 +87,24 @@ def _collect_all_stats(model, dataloader, device):
             if hasattr(model, 'last_pruning_info'):
                 stats['vision_pruned_len'] = model.last_pruning_info['pruned_length']
             else:
-                # 若未启用剪枝模块(或未记录pruning_info), 视为保留原长度
-                # 用当前forward的vision长度作为"after"长度，避免出现 55 -> 0 的误导统计
                 stats['vision_pruned_len'] = inputs['V'].shape[1]
 
-            # 收集per-sample info for case study
+            # 收集门控值（gate_conf_weight / gate_alpha）
+            if hasattr(model, 'last_gate_conf_weight'):
+                stats['gate_weights'].append(model.last_gate_conf_weight.cpu())
+            if hasattr(model, 'last_gate_alpha'):
+                for m in ['T', 'A', 'V']:
+                    stats['gate_alpha'][m].append(model.last_gate_alpha[m].cpu())
+
+            # 收集per-sample info for case study + alignment heatmap
             if hasattr(model, 'last_conflict_intensity'):
-                B = inputs['V'].shape[0]
-                for b in range(B):
-                    stats['samples'].append({
+                B_bs = inputs['V'].shape[0]
+                # 取 attn_vt (第一个样本) for case study
+                attn_vt_batch = None
+                if hasattr(model, 'last_attn_weights') and model.last_attn_weights is not None:
+                    attn_vt_batch = model.last_attn_weights.get('attn_vt', None)
+                for b in range(B_bs):
+                    sample_dict = {
                         'vision': data['vision'][b],
                         'audio': data['audio'][b],
                         'text': data['text'][b],
@@ -94,7 +113,11 @@ def _collect_all_stats(model, dataloader, device):
                         'labels': {'M': data['labels']['M'][b]},
                         'C': model.last_conflict_intensity[b].item(),
                         'pred': pred[b].item(),
-                    })
+                    }
+                    # 保存对齐权重切片（[L_v, L_t]）用于热力图
+                    if attn_vt_batch is not None:
+                        sample_dict['attn_vt'] = attn_vt_batch[b].cpu()
+                    stats['samples'].append(sample_dict)
 
     # Concatenate
     if stats['C']:
@@ -114,6 +137,15 @@ def _collect_all_stats(model, dataloader, device):
         else:
             stats['con_counts'][m] = np.array([])
             stats['conf_counts'][m] = np.array([])
+    if stats['gate_weights']:
+        stats['gate_weights'] = torch.cat(stats['gate_weights']).numpy()
+    else:
+        stats['gate_weights'] = np.array([])
+    for m in ['T', 'A', 'V']:
+        if stats['gate_alpha'][m]:
+            stats['gate_alpha'][m] = torch.cat(stats['gate_alpha'][m]).numpy()
+        else:
+            stats['gate_alpha'][m] = np.array([])
 
     return stats
 
@@ -611,6 +643,330 @@ def visualize_evidence_summary_table(stats, save_dir):
 
 
 # ============================================================
+# 9. Gate Behavior: α vs C 散点 + 分箱均值曲线
+# ============================================================
+def visualize_gate_behavior(stats, save_dir):
+    """
+    门控行为可视化: conf_weight (α) vs 冲突强度 C.
+    回答审稿人质疑: "路由真的发生了吗？门控是否跟随冲突强度变化？"
+
+    图表包含:
+    - 左: C vs conf_weight 散点图 + 分箱均值折线（带 std 误差棒）
+    - 右: per-modality alpha (α_T/V/A) 随 C 的分箱均值
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    C = stats['C']
+    gate_w = stats['gate_weights']
+    if len(C) == 0 or len(gate_w) == 0:
+        print("Warning: No gate weights recorded. Make sure use_conflict_js=True and model ran a forward pass.")
+        return
+
+    n_bins = 5
+    bin_edges = np.linspace(C.min(), C.max() + 1e-8, n_bins + 1)
+    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+
+    # 分箱统计 conf_weight
+    bin_means, bin_stds, bin_counts = [], [], []
+    for i in range(n_bins):
+        mask = (C >= bin_edges[i]) & (C < bin_edges[i + 1])
+        vals = gate_w[mask]
+        bin_counts.append(mask.sum())
+        bin_means.append(vals.mean() if len(vals) > 0 else np.nan)
+        bin_stds.append(vals.std() if len(vals) > 1 else 0.0)
+
+    has_alpha = any(len(stats['gate_alpha'][m]) > 0 for m in ['T', 'A', 'V'])
+    ncols = 2 if has_alpha else 1
+    fig, axes = plt.subplots(1, ncols, figsize=(7 * ncols, 5))
+    if ncols == 1:
+        axes = [axes]
+
+    # 左图：conf_weight vs C
+    ax = axes[0]
+    sc = ax.scatter(C, gate_w, c=C, cmap='RdYlBu_r', alpha=0.35, s=10, edgecolors='none')
+    plt.colorbar(sc, ax=ax, label='C')
+    ax.errorbar(bin_centers, bin_means, yerr=bin_stds, fmt='o-',
+                color='black', linewidth=2, markersize=7, capsize=5, label='Bin mean ± std')
+    ax.set_xlabel('Conflict Intensity C', fontsize=12)
+    ax.set_ylabel('Gate Weight (conf_weight α)', fontsize=12)
+    ax.set_title('Gate Behavior: α vs Conflict Intensity C', fontsize=13)
+    ax.legend(fontsize=10)
+    ax.grid(alpha=0.3)
+    corr = np.corrcoef(C, gate_w)[0, 1] if len(C) > 1 else 0.0
+    ax.text(0.05, 0.95, f'Pearson r = {corr:.4f}', transform=ax.transAxes,
+            fontsize=11, verticalalignment='top',
+            bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+    # 右图（如有）：per-modality alpha
+    if has_alpha:
+        ax2 = axes[1]
+        colors = {'T': '#2ECC71', 'V': '#9B59B6', 'A': '#3498DB'}
+        for m in ['T', 'V', 'A']:
+            alpha_vals = stats['gate_alpha'][m]
+            if len(alpha_vals) == 0:
+                continue
+            m_means, m_stds = [], []
+            for i in range(n_bins):
+                mask = (C >= bin_edges[i]) & (C < bin_edges[i + 1])
+                vals = alpha_vals[mask]
+                m_means.append(vals.mean() if len(vals) > 0 else np.nan)
+                m_stds.append(vals.std() if len(vals) > 1 else 0.0)
+            ax2.errorbar(bin_centers, m_means, yerr=m_stds, fmt='o-',
+                         color=colors[m], linewidth=2, markersize=7, capsize=4, label=f'α_{m}')
+        ax2.set_xlabel('Conflict Intensity C (binned)', fontsize=12)
+        ax2.set_ylabel('Per-modality Gate α', fontsize=12)
+        ax2.set_title('Per-modality Gate α by Conflict Bin', fontsize=13)
+        ax2.legend(fontsize=10)
+        ax2.grid(alpha=0.3)
+
+    plt.tight_layout()
+    save_path = os.path.join(save_dir, 'gate_behavior.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"\nGate behavior visualization saved to {save_path}")
+    print(f"  conf_weight: mean={gate_w.mean():.4f}, std={gate_w.std():.4f}")
+    print(f"  Pearson r(C, conf_weight) = {corr:.4f}")
+    for i in range(n_bins):
+        print(f"  Bin {i} (n={bin_counts[i]}): C≈{bin_centers[i]:.3f}, α_mean={bin_means[i]:.4f}±{bin_stds[i]:.4f}")
+
+
+# ============================================================
+# 10. Alignment Heatmap Case Study (V→T attn + conflict tokens)
+# ============================================================
+def visualize_c_vs_label_disagreement(stats, save_dir):
+    """
+    分析模型的冲突强度 C 与 CH-SIMS 数据集模态级标签分歧度的关系。
+    回答：C 是否捕捉到了数据集中真实存在的跨模态情感分歧（T/A/V label inconsistency）？
+
+    绘制：
+      左上: scatter C vs D_TA (|y_T - y_A|), Pearson r
+      右上: scatter C vs D_TV (|y_T - y_V|), Pearson r
+      左下: scatter C vs D_AV (|y_A - y_V|), Pearson r
+      右下: scatter C vs D_all (mean of three pairwise), + 分桶均值折线
+    """
+    # 检查是否有模态标签
+    has_T = len(stats['modal_labels']['T']) > 0
+    has_A = len(stats['modal_labels']['A']) > 0
+    has_V = len(stats['modal_labels']['V']) > 0
+    if not (has_T and has_A and has_V):
+        print("  Skipped: modal labels (T/A/V) not available in this dataset.")
+        return
+
+    def _to_1d(x):
+        arr = x.numpy() if hasattr(x, 'numpy') else np.array(x)
+        return np.atleast_1d(arr.flatten())
+
+    C   = np.concatenate([_to_1d(c) for c in stats['C']])
+    y_T = np.concatenate([_to_1d(x) for x in stats['modal_labels']['T']])
+    y_A = np.concatenate([_to_1d(x) for x in stats['modal_labels']['A']])
+    y_V = np.concatenate([_to_1d(x) for x in stats['modal_labels']['V']])
+    C = C.flatten(); y_T = y_T.flatten(); y_A = y_A.flatten(); y_V = y_V.flatten()
+
+    # 对齐长度（以最短为准）
+    n = min(len(C), len(y_T), len(y_A), len(y_V))
+    C, y_T, y_A, y_V = C[:n], y_T[:n], y_A[:n], y_V[:n]
+
+    D_TA = np.abs(y_T - y_A)
+    D_TV = np.abs(y_T - y_V)
+    D_AV = np.abs(y_A - y_V)
+    D_all = (D_TA + D_TV + D_AV) / 3.0
+
+    from scipy.stats import pearsonr
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig.suptitle('Conflict Intensity C vs. Modality Label Disagreement\n(Validating that C captures real cross-modal conflict in CH-SIMS)',
+                 fontsize=13, fontweight='bold')
+
+    pairs = [
+        (axes[0, 0], D_TA, 'D_TA = |y_T - y_A|', '#e74c3c', 'Text vs Audio'),
+        (axes[0, 1], D_TV, 'D_TV = |y_T - y_V|', '#3498db', 'Text vs Vision'),
+        (axes[1, 0], D_AV, 'D_AV = |y_A - y_V|', '#2ecc71', 'Audio vs Vision'),
+        (axes[1, 1], D_all, 'D_all = mean(D_TA, D_TV, D_AV)', '#9b59b6', 'Overall Disagreement'),
+    ]
+
+    for ax, D, xlabel, color, title in pairs:
+        r, pval = pearsonr(C, D)
+        # 散点（透明以免遮挡）
+        ax.scatter(C, D, alpha=0.25, s=8, c=color, label=f'n={n}')
+        # 分桶均值折线
+        n_bins = 5
+        bin_edges = np.percentile(C, np.linspace(0, 100, n_bins + 1))
+        bin_edges = np.unique(bin_edges)
+        if len(bin_edges) > 2:
+            bin_means_x, bin_means_y, bin_stds_y = [], [], []
+            for i in range(len(bin_edges) - 1):
+                mask = (C >= bin_edges[i]) & (C < bin_edges[i + 1])
+                if mask.sum() > 0:
+                    bin_means_x.append(C[mask].mean())
+                    bin_means_y.append(D[mask].mean())
+                    bin_stds_y.append(D[mask].std())
+            if bin_means_x:
+                ax.errorbar(bin_means_x, bin_means_y, yerr=bin_stds_y,
+                            fmt='o-', color='black', linewidth=2, markersize=6,
+                            capsize=4, label='Bin mean±std', zorder=5)
+        ax.set_xlabel('Conflict Intensity C', fontsize=11)
+        ax.set_ylabel(xlabel, fontsize=11)
+        ax.set_title(f'{title}\nPearson r = {r:.4f}  (p = {pval:.2e})', fontsize=11)
+        ax.legend(fontsize=9)
+        ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    out_path = os.path.join(save_dir, 'c_vs_label_disagreement.png')
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"C vs label disagreement saved to {out_path}")
+    r_TA, _ = pearsonr(C, D_TA)
+    r_TV, _ = pearsonr(C, D_TV)
+    r_AV, _ = pearsonr(C, D_AV)
+    r_all, _ = pearsonr(C, D_all)
+    print(f"  Pearson r(C, D_TA) = {r_TA:.4f}  |  r(C, D_TV) = {r_TV:.4f}")
+    print(f"  Pearson r(C, D_AV) = {r_AV:.4f}  |  r(C, D_all) = {r_all:.4f}")
+    # 分桶均值表格
+    n_bins = 5
+    bin_edges = np.percentile(C, np.linspace(0, 100, n_bins + 1))
+    bin_edges = np.unique(bin_edges)
+    print(f"\n  {'Bin':>6}  {'n':>5}  {'C_mean':>8}  {'D_TA':>8}  {'D_TV':>8}  {'D_AV':>8}  {'D_all':>8}")
+    for i in range(len(bin_edges) - 1):
+        mask = (C >= bin_edges[i]) & (C < bin_edges[i + 1])
+        if mask.sum() > 0:
+            print(f"  {i:>6}  {mask.sum():>5}  "
+                  f"{C[mask].mean():>8.4f}  "
+                  f"{D_TA[mask].mean():>8.4f}  "
+                  f"{D_TV[mask].mean():>8.4f}  "
+                  f"{D_AV[mask].mean():>8.4f}  "
+                  f"{D_all[mask].mean():>8.4f}")
+
+
+def visualize_alignment_heatmap(model, sample, device, save_dir, case_id=0):
+    """
+    对齐热力图 + 冲突 token 标注 Case Study.
+    回答审稿人质疑: "你的 alignment-aware conflict 是否真的捕捉到语义矛盾？"
+
+    图表包含:
+    - 主图: V→T 注意力权重热力图 (L_v × L_t), 冲突 token 行用红色标注
+    - 右侧: senti_T(j) 柱状图（文本 token 情感强度）
+    - 底部: senti_V(i) 与 senti_ref_V(i) 对比（蓝=V情感, 橙=对齐参照）
+    - 标注: 被判为 conflict/congruent 的帧
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    model.eval()
+    with torch.no_grad():
+        inputs = {
+            'V': sample['vision'].unsqueeze(0).to(device),
+            'A': sample['audio'].unsqueeze(0).to(device),
+            'T': sample['text'].unsqueeze(0).to(device),
+            'mask': {
+                'V': sample['vision_padding_mask'].unsqueeze(0).to(device),
+                'A': sample['audio_padding_mask'].unsqueeze(0).to(device),
+                'T': []
+            }
+        }
+        output, _, _, _, _, _, _ = model(inputs, None)
+
+    # 检查必要属性
+    if not hasattr(model, 'last_attn_weights') or model.last_attn_weights is None:
+        print(f"Warning: No alignment weights. Make sure use_conflict_js=True.")
+        return
+    if 'attn_vt' not in model.last_attn_weights:
+        print("Warning: attn_vt not found in last_attn_weights.")
+        return
+
+    attn_vt = model.last_attn_weights['attn_vt'][0].cpu().numpy()  # [L_v, L_t]
+    L_v, L_t = attn_vt.shape
+
+    C_val = model.last_conflict_intensity[0].item() if hasattr(model, 'last_conflict_intensity') else 0.0
+    pred_val = output[0].item()
+    label_val = sample['labels']['M'].item()
+
+    # 获取冲突/一致 token mask
+    conf_mask_v = np.zeros(L_v, dtype=bool)
+    con_mask_v = np.zeros(L_v, dtype=bool)
+    if hasattr(model, 'last_conf_masks') and model.last_conf_masks is not None:
+        if 'V' in model.last_conf_masks:
+            # conf_masks 对应压缩后的 vision，长度可能 ≠ L_v；对齐到 attn_vt
+            cm = model.last_conf_masks['V'][0].cpu().numpy()
+            n = min(len(cm), L_v)
+            conf_mask_v[:n] = cm[:n]
+    if hasattr(model, 'last_con_masks') and model.last_con_masks is not None:
+        if 'V' in model.last_con_masks:
+            cm = model.last_con_masks['V'][0].cpu().numpy()
+            n = min(len(cm), L_v)
+            con_mask_v[:n] = cm[:n]
+
+    # ---- 绘图 ----
+    fig = plt.figure(figsize=(14, 10))
+    gs = fig.add_gridspec(3, 3, height_ratios=[0.8, 4, 1.5], width_ratios=[4, 0.5, 0.5],
+                          hspace=0.05, wspace=0.05)
+
+    ax_heat = fig.add_subplot(gs[1, 0])
+    ax_senti_t = fig.add_subplot(gs[1, 1], sharey=None)
+    ax_senti_v = fig.add_subplot(gs[2, 0])
+    ax_info = fig.add_subplot(gs[0, :])
+    ax_info.axis('off')
+
+    # 标题信息
+    ax_info.text(0.5, 0.5,
+        f"Case Study #{case_id} | C = {C_val:.4f} | Pred = {pred_val:.3f} | Label = {label_val:.3f} | Error = {abs(pred_val-label_val):.3f}\n"
+        f"Red rows = conflict tokens, Blue rows = congruent tokens (Vision modality)",
+        ha='center', va='center', fontsize=11,
+        bbox=dict(boxstyle='round,pad=0.4', facecolor='lightyellow', alpha=0.9))
+
+    # 热力图
+    im = ax_heat.imshow(attn_vt, aspect='auto', cmap='Blues', interpolation='nearest')
+    plt.colorbar(im, ax=ax_heat, fraction=0.03, pad=0.01, label='Attn weight')
+
+    # 标注冲突/一致行
+    for vi in range(L_v):
+        if conf_mask_v[vi]:
+            ax_heat.axhspan(vi - 0.5, vi + 0.5, color='#D94A4A', alpha=0.25, lw=0)
+        elif con_mask_v[vi]:
+            ax_heat.axhspan(vi - 0.5, vi + 0.5, color='#4A90D9', alpha=0.20, lw=0)
+
+    ax_heat.set_xlabel('Text token index j', fontsize=10)
+    ax_heat.set_ylabel('Vision frame index i', fontsize=10)
+    ax_heat.set_title('V→T Alignment Weights (attn_vt)', fontsize=11)
+
+    # 文本 token 重要性（列均值，代理 senti_T）
+    col_importance = attn_vt.mean(axis=0)  # [L_t]
+    colors_t = ['#D94A4A' if v > col_importance.mean() else '#AAAAAA' for v in col_importance]
+    ax_senti_t.barh(range(L_t), col_importance, color=colors_t, alpha=0.8)
+    ax_senti_t.set_xlabel('Attn col-mean', fontsize=8)
+    ax_senti_t.set_yticks([])
+    ax_senti_t.set_title('Text\nimportance', fontsize=9)
+    ax_senti_t.grid(axis='x', alpha=0.3)
+
+    # 视觉帧行均值（代理 senti_V 对参照）
+    row_attn_sum = attn_vt.sum(axis=1)  # [L_v]
+    bar_colors = []
+    for vi in range(L_v):
+        if conf_mask_v[vi]:
+            bar_colors.append('#D94A4A')
+        elif con_mask_v[vi]:
+            bar_colors.append('#4A90D9')
+        else:
+            bar_colors.append('#AAAAAA')
+    ax_senti_v.bar(range(L_v), row_attn_sum, color=bar_colors, alpha=0.8)
+    ax_senti_v.set_xlabel('Vision frame index i', fontsize=10)
+    ax_senti_v.set_ylabel('Attn row-sum\n(alignment strength)', fontsize=9)
+    ax_senti_v.set_xlim(-0.5, L_v - 0.5)
+    ax_senti_v.grid(axis='y', alpha=0.3)
+
+    # 图例
+    from matplotlib.patches import Patch
+    legend_elements = [
+        Patch(facecolor='#D94A4A', alpha=0.5, label='Conflict token'),
+        Patch(facecolor='#4A90D9', alpha=0.5, label='Congruent token'),
+        Patch(facecolor='#AAAAAA', alpha=0.5, label='Neutral'),
+    ]
+    ax_senti_v.legend(handles=legend_elements, loc='upper right', fontsize=8)
+
+    save_path = os.path.join(save_dir, f'alignment_heatmap_case{case_id}.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"  Alignment heatmap (case {case_id}) saved to {save_path}")
+    print(f"    C={C_val:.4f}, Pred={pred_val:.3f}, Label={label_val:.3f}")
+
+
+# ============================================================
 # Main: Generate All Visualizations
 # ============================================================
 def generate_all_visualizations(model, test_loader, device, save_dir='./results/visualizations'):
@@ -660,8 +1016,28 @@ def generate_all_visualizations(model, test_loader, device, save_dir='./results/
     print("\n8. Conflict bucket vs performance...")
     visualize_conflict_bucket_performance(stats, save_dir)
 
+    # 9. Gate behavior (α vs C) — 回答"路由真的发生了吗？"
+    print("\n9. Gate behavior (α vs C)...")
+    visualize_gate_behavior(stats, save_dir)
+
+    # 10. Alignment heatmap case studies — 回答"对齐感知冲突是否捕捉到语义矛盾？"
+    print("\n10. Alignment heatmap case studies...")
+    samples = stats['samples']
+    if len(samples) > 0:
+        all_C = np.array([s['C'] for s in samples])
+        high_idx = int(np.argmax(all_C))
+        low_idx = int(np.argmin(all_C))
+        for case_id, idx in [(0, high_idx), (1, low_idx)]:
+            desc = 'high' if case_id == 0 else 'low'
+            print(f"  Case {case_id} ({desc} conflict, C={all_C[idx]:.4f})...")
+            visualize_alignment_heatmap(model, samples[idx], device, save_dir, case_id)
+
+    # 11. C vs 模态标签分歧度（直接验证 C 捕捉到了数据集中真实的跨模态冲突）
+    print("\n11. C vs modality label disagreement...")
+    visualize_c_vs_label_disagreement(stats, save_dir)
+
     print(f"\n{'='*60}")
-    print(f"All 8 visualizations saved to {save_dir}/")
+    print(f"All 11 visualizations saved to {save_dir}/")
     print(f"{'='*60}")
 
 

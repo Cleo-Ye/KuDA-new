@@ -3,10 +3,7 @@ import torch.nn.functional as F
 from torch import nn
 from models.Encoder_KIAdapter import UnimodalEncoder
 from models.DyRoutFusion_CLS import DyRoutTrans, SentiCLS
-# Phase 1: 注释掉calculate_ratio_senti,不再使用
-# from core.utils import calculate_ratio_senti
-# Phase 2: 导入ConflictJS
-from models.ConflictJS import ConflictJSModule
+from models.ConflictJS import ConflictJSModule, _reliability_from_entropy
 from models.VisionTokenPruner import VisionTokenPruner, TextGuidedVisionPruner
 from models.AudioTokenFilter import AudioTokenFilter
 
@@ -87,23 +84,55 @@ class KMSA(nn.Module):
         uni_mask = inputs_data_mask['mask']
         self.last_uni_senti_text = uni_senti['T'].detach()
         
-        # Step 3: 单模态去冗余压缩 (在ConflictJS之前)
+        # ============================================================
+        # Step 3a: A 模块 —— 提前计算对齐权重（A→B 共享核心）
+        # 当 use_conflict_js=True 时，AlignmentAwareReference 作为"A 模块"
+        # 产生 attn_vt/attn_at，IEC（B 模块）和 ICR 共享同一套对齐信号
+        # ============================================================
+        precomputed_attn_vt = None
+        precomputed_senti_ref = None
+
+        if self.opt.use_conflict_js and self.conflict_js is not None and self.conflict_js.use_alignment_ref:
+            # 计算文本 token 可靠度，用于 Rel_T 再加权
+            rel_T = _reliability_from_entropy(posteriors['T'])  # [B, L_t]
+
+            # 构建 padding mask（True=padding，符合 MHA key_padding_mask 约定）
+            _mask_T = uni_mask.get('T')
+            mask_T_pad = (~_mask_T) if (isinstance(_mask_T, torch.Tensor) and _mask_T.numel() > 0) else None
+            _mask_V = uni_mask.get('V')
+            mask_V_pad = (~_mask_V) if (isinstance(_mask_V, torch.Tensor) and _mask_V.numel() > 0) else None
+            _mask_A = uni_mask.get('A')
+            mask_A_pad = (~_mask_A) if (isinstance(_mask_A, torch.Tensor) and _mask_A.numel() > 0) else None
+
+            senti_ref_T, senti_ref_V, senti_ref_A, attn_weights = self.conflict_js.align_ref(
+                uni_fea['T'], uni_fea['V'], uni_fea['A'],
+                senti_scores['T'], senti_scores['V'], senti_scores['A'],
+                mask_T=mask_T_pad, mask_V=mask_V_pad, mask_A=mask_A_pad,
+                rel_T=rel_T
+            )
+            precomputed_attn_vt = attn_weights['attn_vt']   # [B, L_v, L_t]
+            precomputed_senti_ref = {'T': senti_ref_T, 'V': senti_ref_V, 'A': senti_ref_A}
+            self.last_attn_weights = attn_weights            # 供可视化使用
+            self.conflict_js._last_attn_weights = attn_weights
+
+        # ============================================================
+        # Step 3b: 单模态去冗余压缩（IEC = B 模块，消费 A 产生的 attn_vt）
+        # ============================================================
         self.last_vision_original_len = uni_fea['V'].shape[1]
         if self.vision_pruner is not None:
             if isinstance(self.vision_pruner, TextGuidedVisionPruner):
-                # mask_v: padding_mask True=padding, 需要 True=valid 故取反
                 mask_v = ~uni_mask['V'] if isinstance(uni_mask.get('V'), torch.Tensor) and uni_mask['V'].numel() > 0 else None
                 mask_t = ~uni_mask['T'] if isinstance(uni_mask.get('T'), torch.Tensor) and uni_mask['T'].numel() > 0 else None
                 pruned_v, retained_idx, pruning_info = self.vision_pruner(
                     uni_fea['V'], uni_fea['T'], senti_scores['T'],
-                    mask_v=mask_v, mask_t=mask_t
+                    mask_v=mask_v, mask_t=mask_t,
+                    precomputed_attn_vt=precomputed_attn_vt.detach() if precomputed_attn_vt is not None else None  # A→B 共享，detach 避免 IEC/ICR 梯度互扰
                 )
             else:
                 pruned_v, retained_idx, pruning_info = self.vision_pruner(
                     uni_fea['V'], posteriors['V']
                 )
             uni_fea['V'] = pruned_v
-            # 同步更新vision的posteriors/senti_scores/mask (posteriors仅pruning不merge)
             posteriors['V'] = torch.gather(
                 posteriors['V'], 1,
                 retained_idx.unsqueeze(-1).expand(-1, -1, posteriors['V'].shape[-1])
@@ -111,25 +140,36 @@ class KMSA(nn.Module):
             senti_scores['V'] = torch.gather(senti_scores['V'], 1, retained_idx)
             uni_mask['V'] = pruning_info['pruned_mask']
             self.last_pruning_info = pruning_info
+            # 更新 precomputed_senti_ref 的 V 维度以匹配剪枝后长度
+            if precomputed_senti_ref is not None:
+                precomputed_senti_ref['V'] = torch.gather(
+                    precomputed_senti_ref['V'], 1, retained_idx
+                )
 
-        # Step 3b: Audio 轻量压缩 (可选)
+        # Step 3c: Audio 轻量压缩 (可选)
         if self.audio_filter is not None:
             filtered_a, retained_idx_a, audio_info = self.audio_filter(
                 uni_fea['A'], posteriors['A']
             )
             uni_fea['A'] = filtered_a
-            B, K, C = posteriors['A'].shape[0], retained_idx_a.shape[1], posteriors['A'].shape[-1]
+            B_a, K_a, C_a = posteriors['A'].shape[0], retained_idx_a.shape[1], posteriors['A'].shape[-1]
             posteriors['A'] = torch.gather(
                 posteriors['A'], 1,
-                retained_idx_a.unsqueeze(-1).expand(-1, -1, C)
+                retained_idx_a.unsqueeze(-1).expand(-1, -1, C_a)
             )
-            senti_scores['A'] = torch.gather(
-                senti_scores['A'], 1, retained_idx_a
-            )
+            senti_scores['A'] = torch.gather(senti_scores['A'], 1, retained_idx_a)
             uni_mask['A'] = audio_info['pruned_mask']
             self.last_audio_pruning_info = audio_info
-        
-        # Step 4-5: Conflict-JS冲突检测 (在压缩后的token上做证据分流+JS)
+            # 更新 precomputed_senti_ref 的 A 维度
+            if precomputed_senti_ref is not None:
+                precomputed_senti_ref['A'] = torch.gather(
+                    precomputed_senti_ref['A'], 1, retained_idx_a
+                )
+
+        # ============================================================
+        # Step 4-5: Conflict-JS 冲突检测（ICR）
+        # 若 A→B 共享已计算好 senti_ref，直接传入，跳过内部 align_ref 调用
+        # ============================================================
         C = None
         C_m = None
         con_masks = None
@@ -138,39 +178,41 @@ class KMSA(nn.Module):
         js_loss = torch.tensor(0.0, device=device)
         con_loss = torch.tensor(0.0, device=device)
         cal_loss = torch.tensor(0.0, device=device)
-        
+
         conflict_rho = None
         conflict_rho_m = None
         if self.opt.use_conflict_js and self.conflict_js is not None:
             mask_dict = dict(uni_mask)
             if not (isinstance(mask_dict.get('T'), torch.Tensor) and mask_dict['T'].numel() > 0):
-                mask_dict['T'] = torch.ones(posteriors['T'].shape[0], posteriors['T'].shape[1], dtype=torch.bool, device=next(self.parameters()).device)
+                mask_dict['T'] = torch.ones(posteriors['T'].shape[0], posteriors['T'].shape[1], dtype=torch.bool, device=device)
             C, C_m, con_masks, conf_masks, P_conf_dict, inter_div, conflict_rho, conflict_rho_m = self.conflict_js(
                 posteriors, senti_scores,
-                senti_ref_per_token=None,
-                hidden_dict=uni_fea,
+                senti_ref_per_token=precomputed_senti_ref,  # None 时内部自行计算
+                hidden_dict=uni_fea if precomputed_senti_ref is None else None,
                 mask_dict=mask_dict
             )
-            self.last_JS_inter = inter_div.detach()  # 保留命名兼容可视化; 实际可为 JS 或 KL
+            self.last_JS_inter = inter_div.detach()
             self.last_conflict_intensity = C.detach()
             self.last_conflict_intensity_m = {m: C_m[m].detach() for m in C_m}
             self.last_con_masks = con_masks
             self.last_conf_masks = conf_masks
-            
-            # L_JS正则: -inter_div 鼓励冲突证据保持差异性(不被压制); inter_div 可为 JS 或 KL
-            js_loss = -inter_div.mean()
-            
-            # P0.4: L_con一致性损失 - 鼓励跨模态congruent表征对齐
+
+            # Contrastive divergence calibration: align inter_div with C
+            # High-C (conflict) samples should have high JSD; low-C (congruent) low JSD.
+            # Using C as a soft target avoids the circular-gradient issue
+            # (C itself is derived from inter_div, so we detach it as pseudo-label).
+            # This replaces the incorrect "-inter_div.mean()" which maximized divergence
+            # unconditionally and directly fought senti_aux_loss.
+            _ln3 = torch.log(torch.tensor(3.0, device=inter_div.device))
+            inter_div_norm = (inter_div / _ln3).clamp(0.0, 1.0)
+            with torch.no_grad():
+                C_tgt = C.detach()
+            js_loss = F.mse_loss(inter_div_norm, C_tgt)
             con_loss = self._compute_con_consistency_loss(uni_fea, con_masks)
-            
-            # P1: L_cal校准损失 - 让C与真实模态分歧D对齐
             cal_loss = self._compute_calibration_loss(C, senti_scores, gt_modal_labels)
-            
-            # SentimentProjector辅助监督损失
+
             if multi_senti is not None:
-                senti_aux_loss = self._compute_senti_aux_loss(
-                    posteriors, multi_senti
-                )
+                senti_aux_loss = self._compute_senti_aux_loss(posteriors, multi_senti)
         
         # Step 6: 动态融合 - 传入冲突强度C/C_m、冲突密度rho和证据masks(双通路)
         multimodal_features, nce_loss = self.DyMultiFus(
@@ -182,6 +224,11 @@ class KMSA(nn.Module):
             con_masks=con_masks,
             conf_masks=conf_masks
         )
+
+        # 暴露门控值供可视化（来自 DyRoutTrans 最后一个 block）
+        if hasattr(self.DyMultiFus, 'last_gate_conf_weight'):
+            self.last_gate_conf_weight = self.DyMultiFus.last_gate_conf_weight  # [B]
+            self.last_gate_alpha = self.DyMultiFus.last_gate_alpha              # {'T','V','A': [B]}
 
         # Sentiment Classification
         prediction = self.CLS(multimodal_features)

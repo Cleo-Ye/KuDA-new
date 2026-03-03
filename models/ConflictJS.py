@@ -10,7 +10,8 @@ import torch.nn.functional as F
 
 class AlignmentAwareReference(nn.Module):
     """
-    对齐感知局部参照: senti_ref_mi = Σ_j attn_{i,j}·senti_Tj
+    对齐感知局部参照: senti_ref_mi = Σ_j ã_{i,j}·senti_Tj
+    ã_{i,j} = a_{i,j}·Rel_T(j) / Σ_k a_{i,k}·Rel_T(k)  (Rel_T 再加权, 可选)
     ref_V = Attn(V→T) @ senti_T, ref_A = Attn(A→T) @ senti_T
     ref_T = 0.5*(Attn(T→V)@senti_V + Attn(T→A)@senti_A)
     """
@@ -23,14 +24,17 @@ class AlignmentAwareReference(nn.Module):
         self.attn_t2a = nn.MultiheadAttention(align_dim, nhead, batch_first=True)
 
     def forward(self, hidden_T, hidden_V, hidden_A, senti_T, senti_V, senti_A,
-                mask_T=None, mask_V=None, mask_A=None):
+                mask_T=None, mask_V=None, mask_A=None, rel_T=None):
         """
         Args:
             hidden_T [B,L_t,1536], hidden_V [B,L_v,256], hidden_A [B,L_a,256]
             senti_T/V/A [B,L_m]
             mask_*: [B,L] True=padding (key_padding_mask convention)
+            rel_T: [B,L_t] 文本 token 可靠度, 用于 Rel_T 再加权 (可选)
+                   ã_{i,j} = a_{i,j}·Rel_T(j) / Σ_k a_{i,k}·Rel_T(k)
         Returns:
-            senti_ref_T [B,L_t], senti_ref_V [B,L_v], senti_ref_A [B,L_a]
+            senti_ref_T [B,L_t], senti_ref_V [B,L_v], senti_ref_A [B,L_a],
+            attn_weights: {'attn_vt': [B,L_v,L_t], 'attn_at': [B,L_a,L_t]}
         """
         B, L_t, _ = hidden_T.shape
         device = hidden_T.device
@@ -42,9 +46,22 @@ class AlignmentAwareReference(nn.Module):
         kp_A = mask_A if mask_A is not None else torch.zeros(B, hidden_A.shape[1], dtype=torch.bool, device=device)
 
         _, attn_vt = self.attn_v2t(hidden_V, T_proj, T_proj, key_padding_mask=kp_T, average_attn_weights=True)
-        senti_ref_V = torch.bmm(attn_vt, senti_T.unsqueeze(-1)).squeeze(-1)  # [B, L_v]
-
+        # [B, L_v, L_t]
         _, attn_at = self.attn_a2t(hidden_A, T_proj, T_proj, key_padding_mask=kp_T, average_attn_weights=True)
+        # [B, L_a, L_t]
+
+        # Rel_T 再加权: ã_{i,j} = a_{i,j}·Rel_T(j) / Σ_k a_{i,k}·Rel_T(k)
+        # 把"文本不是永远可信"从叙事变成公式：可靠度低的文本 token 对参照的贡献自动降权
+        if rel_T is not None:
+            valid_t_mask = (~kp_T).float()  # [B, L_t], 1=valid
+            w = rel_T * valid_t_mask  # [B, L_t]
+            w = w.unsqueeze(1)  # [B, 1, L_t]
+            attn_vt = attn_vt * w
+            attn_vt = attn_vt / (attn_vt.sum(dim=-1, keepdim=True).clamp(min=1e-8))
+            attn_at = attn_at * w
+            attn_at = attn_at / (attn_at.sum(dim=-1, keepdim=True).clamp(min=1e-8))
+
+        senti_ref_V = torch.bmm(attn_vt, senti_T.unsqueeze(-1)).squeeze(-1)  # [B, L_v]
         senti_ref_A = torch.bmm(attn_at, senti_T.unsqueeze(-1)).squeeze(-1)  # [B, L_a]
 
         _, attn_tv = self.attn_t2v(T_proj, hidden_V, hidden_V, key_padding_mask=kp_V, average_attn_weights=True)
@@ -52,7 +69,9 @@ class AlignmentAwareReference(nn.Module):
         _, attn_ta = self.attn_t2a(T_proj, hidden_A, hidden_A, key_padding_mask=kp_A, average_attn_weights=True)
         ref_t_from_a = torch.bmm(attn_ta, senti_A.unsqueeze(-1)).squeeze(-1)  # [B, L_t]
         senti_ref_T = 0.5 * (ref_t_from_v + ref_t_from_a)
-        return senti_ref_T, senti_ref_V, senti_ref_A
+
+        attn_weights = {'attn_vt': attn_vt, 'attn_at': attn_at}
+        return senti_ref_T, senti_ref_V, senti_ref_A, attn_weights
 
 
 def _entropy_per_token(posteriors, eps=1e-8):
@@ -341,14 +360,18 @@ class ConflictJSModule(nn.Module):
             mask_A = ~mask_dict['A'] if mask_dict and mask_dict.get('A') is not None and isinstance(mask_dict['A'], torch.Tensor) else None
             if mask_T is not None and mask_T.numel() == 0:
                 mask_T = None
-            senti_ref_T, senti_ref_V, senti_ref_A = self.align_ref(
+            senti_ref_T, senti_ref_V, senti_ref_A, attn_w = self.align_ref(
                 hidden_dict['T'], hidden_dict['V'], hidden_dict['A'],
                 senti_scores_dict['T'], senti_scores_dict['V'], senti_scores_dict['A'],
                 mask_T=mask_T, mask_V=mask_V, mask_A=mask_A
             )
             senti_ref_per_token = {'T': senti_ref_T, 'V': senti_ref_V, 'A': senti_ref_A}
+            self._last_attn_weights = attn_w
         elif senti_ref_per_token is None:
+            # fallback: 全局均值参照（消融用）
             senti_ref_per_token = {m: senti_scores_dict[m].mean(dim=1, keepdim=True).expand_as(senti_scores_dict[m]) for m in ['T', 'A', 'V']}
+            # _last_attn_weights 在 A→B 共享场景下由 OverallModal 提前设置
+        # 若 senti_ref_per_token 由外部预先传入（A→B 共享），_last_attn_weights 已由调用方设置
 
         con_masks, conf_masks = self.splitter(posteriors_dict, senti_scores_dict, senti_ref_per_token, mask_dict)
 

@@ -21,7 +21,8 @@ class TextGuidedVisionPruner(nn.Module):
             embed_dim=hidden_dim, num_heads=nhead, dropout=dropout, batch_first=True
         )
 
-    def forward(self, hidden_v, hidden_t, senti_t, mask_v=None, mask_t=None):
+    def forward(self, hidden_v, hidden_t, senti_t, mask_v=None, mask_t=None,
+                precomputed_attn_vt=None):
         """
         Args:
             hidden_v: [B, L_v, 256]
@@ -29,6 +30,10 @@ class TextGuidedVisionPruner(nn.Module):
             senti_t: [B, L_t]
             mask_v: [B, L_v] True=valid (若 None 则全有效)
             mask_t: [B, L_t] True=valid (若 None 则全有效)
+            precomputed_attn_vt: [B, L_v, L_t] 预计算的 V→T 对齐权重 (可选).
+                若提供，跳过内部 cross-attn 计算，直接使用共享权重打分.
+                这实现 "A→B 共享": AlignmentAwareReference (A) 产生对齐权重,
+                TextGuidedVisionPruner (B) 消费同一套权重做证据压缩.
         Returns:
             hidden_v_new: [B, K, 256]
             retained_indices: [B, K]
@@ -43,27 +48,28 @@ class TextGuidedVisionPruner(nn.Module):
         if mask_t is None:
             mask_t = torch.ones(B, L_t, dtype=torch.bool, device=device)
 
-        # 1) 维度对齐
-        T = self.proj_t(hidden_t)  # [B, L_t, 256]
         V = hidden_v  # [B, L_v, 256]
 
-        # 2) 文本权重 w_t = |senti_t| * mask_t，归一化增强区分度
-        w_t = torch.abs(senti_t).float() * mask_t.float()  # [B, L_t], 范围 [0, 3]
-        # 归一化到和为1，使不同样本的权重分布更一致
+        # 文本情感权重 w_t = |senti_t| * mask_t，归一化增强区分度
+        w_t = torch.abs(senti_t).float() * mask_t.float()  # [B, L_t]
         w_t = w_t / (w_t.sum(dim=1, keepdim=True) + 1e-8)
-        w_t = w_t * mask_t.float()  # 重新应用mask确保padding位置为0
+        w_t = w_t * mask_t.float()
 
-        # 3) V->T cross-attn, 取注意力权重
-        # key_padding_mask: True = padding (mask out)
-        key_padding_mask = ~mask_t  # [B, L_t], True where invalid
-        attn_out, attn_weights = self.cross_attn(
-            V, T, T,
-            key_padding_mask=key_padding_mask,
-            average_attn_weights=True
-        )  # attn_weights: [B, L_v, L_t]
-        attn_vt = attn_weights  # [B, L_v, L_t]
+        if precomputed_attn_vt is not None:
+            # A→B 共享：直接使用来自 AlignmentAwareReference 的对齐权重
+            attn_vt = precomputed_attn_vt  # [B, L_v, L_t]
+        else:
+            # 独立模式（use_conflict_js=False 时）：自行计算 V→T cross-attn
+            T = self.proj_t(hidden_t)  # [B, L_t, 256]
+            key_padding_mask = ~mask_t  # [B, L_t], True where invalid
+            _, attn_weights = self.cross_attn(
+                V, T, T,
+                key_padding_mask=key_padding_mask,
+                average_attn_weights=True
+            )  # [B, L_v, L_t]
+            attn_vt = attn_weights
 
-        # 4) score_v = attn_vt @ w_t, 结合注意力和文本情感权重
+        # score_v = attn_vt @ w_t: 对齐权重与文本情感权重的联合打分
         score_v = torch.bmm(attn_vt, w_t.unsqueeze(-1)).squeeze(-1)  # [B, L_v]
         score_v = score_v.masked_fill(~mask_v, -1e9)
 

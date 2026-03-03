@@ -162,6 +162,14 @@ class DyRout_block(nn.Module):
             # Final fusion: C-gated combination of conflict and congruent paths
             conf_weight = torch.sigmoid(self.gate_k * (conflict_C - self.gate_tau)).view(-1, 1, 1)
             output = conf_weight * h_conf + (1 - conf_weight) * h_con
+
+            # 保存门控值供可视化（在推理时通过 model.last_gate_* 访问）
+            self._last_conf_weight = conf_weight.detach().squeeze(-1).squeeze(-1)  # [B]
+            self._last_alpha = {
+                'T': alpha_t.detach().squeeze(-1).squeeze(-1),  # [B]
+                'V': alpha_v.detach().squeeze(-1).squeeze(-1),
+                'A': alpha_a.detach().squeeze(-1).squeeze(-1),
+            }
         else:
             # Fallback: no conflict info, use conf streams as full features
             cross_f_t = self.f_t_conf(target_x=source, source_x=t_conf, key_padding_mask=t_conf_pad)
@@ -306,6 +314,12 @@ class DyRoutTrans(nn.Module):
         nce_v = self.cpc_fv(hidden_v, source)
         nce_a = self.cpc_fa(hidden_a, source)
         nce_loss = nce_t + nce_v + nce_a
+
+        # 暴露最后一个 block 的门控值供 OverallModal 透传给可视化
+        last_blk = self.dec_list[-1].mhatt1
+        if hasattr(last_blk, '_last_conf_weight'):
+            self.last_gate_conf_weight = last_blk._last_conf_weight  # [B]
+            self.last_gate_alpha = last_blk._last_alpha               # {'T','V','A': [B]}
 
         return source, nce_loss
 

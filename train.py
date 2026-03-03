@@ -184,14 +184,18 @@ def train(model, train_loader, optimizer, loss_fn, epoch, metrics):
             continue
 
         loss_re = loss_fn(output, label)
-        # 改进损失权重平衡: 提升js/con/cal权重,使冲突路由更重要
-        lambda_nce = getattr(opt, 'lambda_nce', 0.08)      # 从0.1降到0.08
-        lambda_senti = getattr(opt, 'lambda_senti', 0.03)  # 从0.05降到0.03
-        lambda_js = getattr(opt, 'lambda_js', 0.15)        # 从0.1提升到0.15
-        lambda_con = getattr(opt, 'lambda_con', 0.12)      # 从0.1提升到0.12
-        lambda_cal = getattr(opt, 'lambda_cal', 0.12)      # 从0.1提升到0.12
+        lambda_nce = getattr(opt, 'lambda_nce', 0.1)
+        lambda_senti = getattr(opt, 'lambda_senti', 0.05)
+        # ICR auxiliary losses: reduced weights + linear warmup over first warmup_epochs epochs.
+        # During early training the conflict signals are noisy; full-strength ICR losses
+        # before the sentiment projector converges caused training to stall at epoch 4.
+        lambda_js = getattr(opt, 'lambda_js', 0.05)   # reduced from 0.12; js_loss is now MSE-calibration
+        lambda_con = getattr(opt, 'lambda_con', 0.08)  # reduced from 0.1
+        lambda_cal = getattr(opt, 'lambda_cal', 0.08)  # reduced from 0.1
+        warmup_epochs = getattr(opt, 'aux_warmup_epochs', 8)
+        aux_warmup = min(1.0, (epoch - 1) / max(warmup_epochs, 1))
         loss = (loss_re + lambda_nce * nce_loss + lambda_senti * senti_aux_loss
-                + lambda_js * js_loss + lambda_con * con_loss + lambda_cal * cal_loss)
+                + aux_warmup * (lambda_js * js_loss + lambda_con * con_loss + lambda_cal * cal_loss))
 
         # NaN 检测：如果 loss 包含 NaN，跳过这个 batch
         if torch.isnan(loss).any() or torch.isinf(loss).any():
