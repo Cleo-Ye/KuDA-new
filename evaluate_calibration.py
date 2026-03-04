@@ -83,20 +83,33 @@ def plot_reliability_diagram(bin_acc_before, bin_conf_before, bin_count_before,
 def evaluate_with_calibration():
     opt = parse_opts()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # 加载模型
-    model = build_model(opt).to(device)
-    
-    # 加载checkpoint
-    ckpt_path = os.path.join('./checkpoints', opt.datasetName.upper(), 'best.pth')
+
+    # checkpoint 路径: 优先 --checkpoint_path，否则默认 ./checkpoints/{DATASET}/best.pth
+    ckpt_path = (getattr(opt, 'checkpoint_path', '') or '').strip()
+    if not ckpt_path:
+        ckpt_path = os.path.join('./checkpoints', opt.datasetName.upper(), 'best.pth')
     if not os.path.exists(ckpt_path):
         print(f"Checkpoint not found: {ckpt_path}")
         return
-    
+
     ckpt = torch.load(ckpt_path, weights_only=False)
-    model.load_state_dict(ckpt['model_state_dict'])
+    # 从 checkpoint 恢复训练时的 opt，保证 build_model(opt) 与保存的模型一致
+    if 'opt' in ckpt:
+        saved_opt = ckpt['opt']
+        for key in ['vision_target_ratio', 'tau_rel', 'tau_conf', 'tau_con',
+                    'use_vision_pruning', 'use_conflict_js', 'use_routing',
+                    'lambda_con', 'lambda_cal', 'iec_mode', 'vision_keep_ratio', 'conflict_metric',
+                    'evidence_split_mode', 'min_conf_k', 'min_con_k', 'align_to_d_tv_only']:
+            if key in saved_opt:
+                setattr(opt, key, saved_opt[key])
+                print(f"  Restored opt.{key} = {saved_opt[key]}")
+    ckpt_state = ckpt['model_state_dict']
+
+    # 加载模型（用恢复后的 opt 构建）
+    model = build_model(opt).to(device)
+    model.load_state_dict(ckpt_state, strict=False)
     print(f"Loaded checkpoint from {ckpt_path}")
-    print(f"  Epoch: {ckpt['epoch']}, Valid MAE: {ckpt['valid_mae']:.4f}, Valid Corr: {ckpt['valid_corr']:.4f}")
+    print(f"  Epoch: {ckpt.get('epoch', '?')}, Valid MAE: {ckpt.get('valid_mae', 0):.4f}, Valid Corr: {ckpt.get('valid_corr', 0):.4f}")
     
     # 加载数据
     dataLoader = MMDataLoader(opt)

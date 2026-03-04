@@ -1054,6 +1054,8 @@ if __name__ == '__main__':
                            help='Path to checkpoint file (default: ./checkpoints/{DATASET}/best.pth)')
     viz_parser.add_argument('--save_dir', type=str, default='',
                            help='Directory to save visualizations (default: ./results/visualizations)')
+    viz_parser.add_argument('--run_calibration', action='store_true',
+                           help='After visualizations, run ECE + reliability diagram and save to save_dir')
     viz_args, _ = viz_parser.parse_known_args()
 
     # opts.parse_opts() 使用 argparse.parse_args(), 遇到未知参数会报错。
@@ -1066,6 +1068,8 @@ if __name__ == '__main__':
             continue
         if a in ['--checkpoint_path', '--save_dir']:
             skip_next = True
+            continue
+        if a == '--run_calibration':
             continue
         filtered_argv.append(a)
     sys.argv = filtered_argv
@@ -1098,7 +1102,8 @@ if __name__ == '__main__':
         saved_opt = ckpt['opt']
         for key in ['vision_target_ratio', 'tau_rel', 'tau_conf', 'tau_con',
                      'use_vision_pruning', 'use_conflict_js', 'use_routing',
-                     'lambda_con', 'lambda_cal']:
+                     'lambda_con', 'lambda_cal', 'iec_mode', 'vision_keep_ratio', 'conflict_metric',
+                     'evidence_split_mode', 'min_conf_k', 'min_con_k', 'align_to_d_tv_only']:
             if key in saved_opt:
                 setattr(opt, key, saved_opt[key])
                 print(f"  Restored opt.{key} = {saved_opt[key]}")
@@ -1146,3 +1151,51 @@ if __name__ == '__main__':
     dataLoader = MMDataLoader(opt)
 
     generate_all_visualizations(model, dataLoader['test'], device, save_dir=save_dir)
+
+    # 可选: 运行校准评估并保存 ECE + reliability diagram 到 save_dir
+    if getattr(viz_args, 'run_calibration', False):
+        print("\n" + "=" * 60)
+        print("Running calibration (ECE + reliability diagram)...")
+        print("=" * 60)
+        from models.TemperatureScaling import calibrate_and_evaluate, compute_ece
+        from evaluate_calibration import plot_reliability_diagram
+        import torch.nn.functional as F
+        n_bins_cal = 15
+        boundaries_cal = torch.linspace(-1.0, 1.0, getattr(opt, 'senti_num_classes', 7) + 1, device=device)[1:-1]
+        logits_list, labels_list = [], []
+        with torch.no_grad():
+            for data in dataLoader['valid']:
+                inputs = {
+                    'V': data['vision'].to(device),
+                    'A': data['audio'].to(device),
+                    'T': data['text'].to(device),
+                    'mask': {
+                        'V': data['vision_padding_mask'][:, 1:data['vision'].shape[1] + 1].to(device),
+                        'A': data['audio_padding_mask'][:, 1:data['audio'].shape[1] + 1].to(device),
+                        'T': []
+                    }
+                }
+                label = data['labels']['M'].to(device).view(-1)
+                uni_fea, uni_senti, posteriors, senti_scores = model.UniEncKI(inputs)
+                avg_post = posteriors['T'].mean(dim=1)
+                label_bins = torch.bucketize(label, boundaries_cal)
+                logits_list.append(torch.log(avg_post + 1e-8).cpu())
+                labels_list.append(label_bins.cpu())
+        logits_all = torch.cat(logits_list, dim=0)
+        labels_all = torch.cat(labels_list, dim=0)
+        post_before = F.softmax(logits_all, dim=-1)
+        ece_before, bin_acc_b, bin_conf_b, bin_count_b = compute_ece(post_before, labels_all, n_bins=n_bins_cal)
+        from models.TemperatureScaling import TemperatureScaling
+        ts = TemperatureScaling()
+        ts.fit(logits_list, labels_list)
+        with torch.no_grad():
+            post_after = ts(logits_all)
+        ece_after, bin_acc_a, bin_conf_a, bin_count_a = compute_ece(post_after, labels_all, n_bins=n_bins_cal)
+        print(f"  ECE Before: {ece_before:.4f}, After: {ece_after:.4f}")
+        plot_reliability_diagram(
+            bin_acc_b, bin_conf_b, bin_count_b,
+            bin_acc_a, bin_conf_a, bin_count_a,
+            save_path=os.path.join(save_dir, 'reliability_diagram.png'),
+            n_bins=n_bins_cal
+        )
+        print(f"  Reliability diagram saved to {save_dir}/reliability_diagram.png")

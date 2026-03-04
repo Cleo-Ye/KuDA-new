@@ -189,10 +189,10 @@ def train(model, train_loader, optimizer, loss_fn, epoch, metrics):
         # ICR auxiliary losses: reduced weights + linear warmup over first warmup_epochs epochs.
         # During early training the conflict signals are noisy; full-strength ICR losses
         # before the sentiment projector converges caused training to stall at epoch 4.
-        lambda_js = getattr(opt, 'lambda_js', 0.05)   # reduced from 0.12; js_loss is now MSE-calibration
-        lambda_con = getattr(opt, 'lambda_con', 0.08)  # reduced from 0.1
-        lambda_cal = getattr(opt, 'lambda_cal', 0.08)  # reduced from 0.1
-        warmup_epochs = getattr(opt, 'aux_warmup_epochs', 8)
+        lambda_js = getattr(opt, 'lambda_js', 0.05)
+        lambda_con = getattr(opt, 'lambda_con', 0.03)
+        lambda_cal = getattr(opt, 'lambda_cal', 0.03)
+        warmup_epochs = getattr(opt, 'aux_warmup_epochs', 15)
         aux_warmup = min(1.0, (epoch - 1) / max(warmup_epochs, 1))
         loss = (loss_re + lambda_nce * nce_loss + lambda_senti * senti_aux_loss
                 + aux_warmup * (lambda_js * js_loss + lambda_con * con_loss + lambda_cal * cal_loss))

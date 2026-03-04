@@ -27,7 +27,10 @@ class KMSA(nn.Module):
                 rel_min=getattr(opt, 'rel_min', 0.20),
                 conf_ratio=getattr(opt, 'conf_ratio', 0.25),
                 con_ratio=getattr(opt, 'con_ratio', 0.25),
-                use_alignment_ref=getattr(opt, 'use_alignment_ref', True)
+                use_alignment_ref=getattr(opt, 'use_alignment_ref', True),
+                evidence_split_mode=getattr(opt, 'evidence_split_mode', 'topk'),
+                min_conf_k=getattr(opt, 'min_conf_k', 4),
+                min_con_k=getattr(opt, 'min_con_k', 4)
             )
         else:
             self.conflict_js = None
@@ -285,12 +288,17 @@ class KMSA(nn.Module):
         
         # 模态分歧: 两两绝对差的均值 (比std更直观, 对2个模态一致1个不一致也敏感)
         D = (torch.abs(y_T - y_A) + torch.abs(y_T - y_V) + torch.abs(y_A - y_V)) / 3.0
-        
+        D_TV = torch.abs(y_T - y_V)
         # 归一化到[0,1]: labels在[-1,1], 最大差值=2, 所以D_max=2
         D_norm = (D / 2.0).clamp(0.0, 1.0)
-        
-        # L1校准损失
-        cal_loss = (C - D_norm).abs().mean()
+        D_TV_norm = (D_TV / 2.0).clamp(0.0, 1.0)
+        # 可选: 仅对齐到 D_TV（文本-视觉分歧），便于先拉高 r(C, D_TV)
+        D_target = D_TV_norm if getattr(self.opt, 'align_to_d_tv_only', False) else D_norm
+        # L1 校准损失 + MSE 对齐 (L_align)，提升 r(C,D) 可辩护性
+        cal_l1 = (C - D_target).abs().mean()
+        align_mse = (C - D_target).pow(2).mean()
+        lambda_align = getattr(self.opt, 'lambda_align', 0.1)
+        cal_loss = cal_l1 + lambda_align * align_mse
         return cal_loss
     
     def _compute_senti_aux_loss(self, posteriors, labels):

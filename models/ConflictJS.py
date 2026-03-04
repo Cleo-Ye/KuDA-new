@@ -102,25 +102,33 @@ def _reliability_from_entropy(posteriors, eps=1e-8):
 
 class EvidenceSplitter(nn.Module):
     """
-    证据拆分: valid = mask & (Rel>=rel_min), d=|senti-ref|, 分位数阈值
-    conf_mask = valid & (d >= thr_conf), con_mask = valid & (d <= thr_con)
-    改进: 使用更激进的分位数,增强冲突/一致证据的区分度
+    证据拆分: 支持两种策略
+    - topk (主策略): 按 d 取 bottom k_con 为 con、top k_conf 为 conf，保证每模态每样本有配额，防塌缩
+    - quantile: valid = mask & (Rel>=rel_min)，分位数阈值；valid 过少时 fallback top-k
     """
     def __init__(self, tau_conf=0.3, tau_con=0.1, tau_rel=0.5,
                  conf_ratio=0.30, con_ratio=0.30, rel_min=0.15,
                  conf_percentile=0.3, con_percentile=0.2,
-                 min_conf_ratio=0.05, min_con_ratio=0.05):
+                 min_conf_ratio=0.05, min_con_ratio=0.05,
+                 use_topk_fallback=True, min_valid_tokens=3, topk_fallback_k=2,
+                 evidence_split_mode='topk', min_conf_k=4, min_con_k=4):
         super().__init__()
         self.tau_conf = tau_conf
         self.tau_con = tau_con
         self.tau_rel = tau_rel
-        self.conf_ratio = conf_ratio  # 提升到0.30,选更多冲突证据
-        self.con_ratio = con_ratio    # 提升到0.30,选更多一致证据
-        self.rel_min = rel_min        # 降低到0.15,包含更多中等可靠度token
+        self.conf_ratio = conf_ratio
+        self.con_ratio = con_ratio
+        self.rel_min = rel_min
         self.conf_percentile = conf_percentile
         self.con_percentile = con_percentile
         self.min_conf_ratio = min_conf_ratio
         self.min_con_ratio = min_con_ratio
+        self.use_topk_fallback = use_topk_fallback
+        self.min_valid_tokens = min_valid_tokens
+        self.topk_fallback_k = topk_fallback_k
+        self.evidence_split_mode = (evidence_split_mode or 'topk').lower()
+        self.min_conf_k = min_conf_k
+        self.min_con_k = min_con_k
 
     def forward(self, posteriors_dict, senti_scores_dict, senti_ref_per_token, mask_dict=None):
         """
@@ -146,11 +154,47 @@ class EvidenceSplitter(nn.Module):
 
             conf_mask = torch.zeros(B, L, dtype=torch.bool, device=device)
             con_mask = torch.zeros(B, L, dtype=torch.bool, device=device)
+            use_topk_primary = (self.evidence_split_mode == 'topk')
+            k_fallback = self.topk_fallback_k
             for b in range(B):
+                effective = mask[b]
+                n_eff = effective.sum().item()
+                if n_eff == 0:
+                    con_mask[b, 0] = True
+                    conf_mask[b, min(1, L - 1)] = True
+                    continue
+                idx_eff = effective.nonzero(as_tuple=True)[0]
+                d_eff = d[b][effective]
+                sorted_idx = torch.argsort(d_eff)
+
+                if use_topk_primary:
+                    # Top-k 主策略: 按比例与最小值确定 k_con / k_conf，保证 Con+Conf 有配额
+                    k_con = max(self.min_con_k, int(n_eff * self.con_ratio))
+                    k_conf = max(self.min_conf_k, int(n_eff * self.conf_ratio))
+                    k_con = min(k_con, n_eff)
+                    k_conf = min(k_conf, n_eff)
+                    if k_con + k_conf > n_eff:
+                        k_con = min(k_con, n_eff // 2)
+                        k_conf = min(k_conf, n_eff - k_con)
+                    con_idx = idx_eff[sorted_idx[:k_con]]
+                    conf_idx = idx_eff[sorted_idx[-k_conf:]]
+                    con_mask[b, con_idx] = True
+                    conf_mask[b, conf_idx] = True
+                    continue
+                # quantile 策略（含 fallback）
+                n_valid = valid[b].sum().item()
+                use_fallback = (self.use_topk_fallback and n_valid < self.min_valid_tokens)
+                if use_fallback:
+                    k = min(k_fallback, max(1, n_eff // 2))
+                    con_idx = idx_eff[sorted_idx[:k]]
+                    conf_idx = idx_eff[sorted_idx[-k:]]
+                    con_mask[b, con_idx] = True
+                    conf_mask[b, conf_idx] = True
+                    continue
                 d_valid = d[b][valid[b]]
                 if d_valid.numel() == 0:
-                    conf_mask[b, 0] = True
-                    con_mask[b, min(1, L - 1)] = True
+                    conf_mask[b, d[b].argmax().item()] = True
+                    con_mask[b, d[b].argmin().item()] = True
                     continue
                 thr_conf = torch.quantile(d_valid.float(), 1.0 - self.conf_ratio)
                 thr_con = torch.quantile(d_valid.float(), self.con_ratio)
@@ -163,7 +207,6 @@ class EvidenceSplitter(nn.Module):
                             con_mask[b, oi] = False
                         else:
                             conf_mask[b, oi] = False
-                # 保底在重叠解析之后执行，确保至少各 1 个
                 if conf_mask[b].sum() == 0:
                     conf_mask[b, d[b].argmax().item()] = True
                 if con_mask[b].sum() == 0:
@@ -316,13 +359,12 @@ class ConflictIntensity(nn.Module):
         C = torch.clamp(JS_inter / self.ln3, 0.0, 1.0)
         C_m = {}
         if P_conf_dict is not None:
-            P_T = P_conf_dict['T']
+            # 各模态 C_m = JS(P_m, P_avg)：以三模态均匀混合为基准，衡量每个模态自身的偏离程度
+            P_avg = (P_conf_dict['T'] + P_conf_dict['A'] + P_conf_dict['V']) / 3.0
             for m in ['T', 'A', 'V']:
                 P_m = P_conf_dict[m]
-                jsd2 = self.js_calc.jensen_shannon_divergence_2(P_m, P_T)
+                jsd2 = self.js_calc.jensen_shannon_divergence_2(P_m, P_avg)
                 C_m[m] = torch.clamp(jsd2 / self.ln2, 0.0, 1.0)
-            C_T = 0.5 * (C_m['A'] + C_m['V'])
-            C_m['T'] = C_T
         else:
             for m in ['T', 'A', 'V']:
                 C_m[m] = C
@@ -334,12 +376,16 @@ class ConflictJSModule(nn.Module):
     完整的Conflict-JS模块: AlignmentAwareReference + EvidenceSplitter + JS + ConflictIntensity
     """
     def __init__(self, tau_conf=0.3, tau_con=0.1, tau_rel=0.5, num_classes=7, conflict_metric='js',
-                 rel_min=0.20, conf_ratio=0.25, con_ratio=0.25, use_alignment_ref=True):
+                 rel_min=0.20, conf_ratio=0.25, con_ratio=0.25, use_alignment_ref=True,
+                 evidence_split_mode='topk', min_conf_k=4, min_con_k=4):
         super().__init__()
         self.use_alignment_ref = use_alignment_ref
         if use_alignment_ref:
             self.align_ref = AlignmentAwareReference(text_dim=1536, align_dim=256, nhead=4)
-        self.splitter = EvidenceSplitter(tau_conf, tau_con, tau_rel, conf_ratio=conf_ratio, con_ratio=con_ratio, rel_min=rel_min)
+        self.splitter = EvidenceSplitter(
+            tau_conf, tau_con, tau_rel, conf_ratio=conf_ratio, con_ratio=con_ratio, rel_min=rel_min,
+            evidence_split_mode=evidence_split_mode, min_conf_k=min_conf_k, min_con_k=min_con_k
+        )
         self.js_calculator = EvidenceLevelJS()
         self.intensity = ConflictIntensity(num_classes)
         self.conflict_metric = conflict_metric
