@@ -1,0 +1,8 @@
+{
+  "datasetName": "sims",
+  "model_type": "pid_dualpath",
+  "n_epochs": 100,
+  "milestones": [60, 80, 100],
+  "batch_sizes": [48, 64],
+  "lrs": [2e-5, 3e-5]
+}

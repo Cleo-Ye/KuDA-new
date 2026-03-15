@@ -8,6 +8,7 @@ import sys
 import json
 import copy
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from opts import parse_opts
 from core.dataset import MMDataLoader
@@ -63,16 +64,15 @@ def train_model(model, dataLoader, opt, device):
             label = data['labels']['M'].to(device).view(-1, 1)
             copy_label = label.clone().detach()
             
-            output, nce_loss, senti_aux_loss, js_loss, con_loss, cal_loss, _ = model(inputs, copy_label)
+            output, senti_aux_loss, L_PID, F_cons, F_conf, S, _ = model(inputs, copy_label)
             
             loss_re = loss_fn(output, label)
-            lambda_nce = getattr(opt, 'lambda_nce', 0.1)
             lambda_senti = getattr(opt, 'lambda_senti', 0.05)
-            lambda_js = getattr(opt, 'lambda_js', 0.1)
-            lambda_con = getattr(opt, 'lambda_con', 0.1)
-            lambda_cal = getattr(opt, 'lambda_cal', 0.1)
-            loss = (loss_re + lambda_nce * nce_loss + lambda_senti * senti_aux_loss
-                    + lambda_js * js_loss + lambda_con * con_loss + lambda_cal * cal_loss)
+            pid_warmup = min(1.0, (epoch - 1) / max(getattr(opt, 'pid_warmup_epochs', 10), 1))
+            loss = loss_re + lambda_senti * senti_aux_loss + pid_warmup * getattr(opt, 'lambda_pid', 0.05) * L_PID
+            dist_intra = (F_conf - F_cons).norm(dim=-1)
+            loss = loss + pid_warmup * getattr(opt, 'lambda_diff', 0.1) * F.relu(getattr(opt, 'margin', 1.0) - dist_intra).mean()
+            loss = loss + pid_warmup * getattr(opt, 'lambda_ortho', 0.01) * (F_conf.T @ F_cons).pow(2).sum()
             
             loss.backward()
             optimizer.step()

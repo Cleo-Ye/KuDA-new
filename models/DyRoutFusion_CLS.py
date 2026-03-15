@@ -18,9 +18,10 @@ class CPC(nn.Module):
         y = torch.mean(y, dim=-2)
         x_pred = y
 
-        # normalize to unit sphere
-        x_pred = x_pred / x_pred.norm(dim=1, keepdim=True)
-        x = x / x.norm(dim=1, keepdim=True)
+        # normalize to unit sphere (clamp to avoid 0/0 -> NaN)
+        eps = 1e-8
+        x_pred = x_pred / (x_pred.norm(dim=1, keepdim=True).clamp(min=eps))
+        x = x / (x.norm(dim=1, keepdim=True).clamp(min=eps))
 
         pos = torch.sum(x*x_pred, dim=-1)   # bs
         neg = torch.logsumexp(torch.matmul(x, x_pred.t()), dim=-1)   # bs

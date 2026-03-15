@@ -198,7 +198,7 @@ def evaluate_with_calibration():
                 }
             }
             label = data['labels']['M'].to(device).view(-1, 1)
-            output, _, _, _, _, _, _ = model(inputs, None)
+            output, _, _, _, _, _ = model(inputs, None)
             y_pred.append(output.cpu())
             y_true.append(label.cpu())
     

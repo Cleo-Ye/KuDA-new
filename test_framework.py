@@ -69,16 +69,15 @@ def test_phase1_baseline():
         labels = test_batch['labels']['M'].to(device)
         
         with torch.no_grad():
-            output, nce_loss, senti_aux_loss, js_loss, con_loss, cal_loss, _ = model(inputs, None)
+            output, senti_aux_loss, L_PID, F_cons, F_conf, S, _ = model(inputs, None)
         
         print(f"Input shapes:")
         print(f"  Text: {inputs['T'].shape}")
         print(f"  Audio: {inputs['A'].shape}")
         print(f"  Vision: {inputs['V'].shape}")
         print(f"Output shape: {output.shape}")
-        print(f"NCE loss: {nce_loss.item():.4f}")
         print(f"Senti aux loss: {senti_aux_loss.item():.4f}")
-        print(f"JS loss: {js_loss.item():.4f}")
+        print(f"L_PID: {L_PID.item():.4f}, S mean: {S.mean().item():.4f}")
         print(f"Sample prediction: {output[0].item():.3f}, Label: {labels[0].item():.3f}")
         
         # 测试backward pass
@@ -86,9 +85,13 @@ def test_phase1_baseline():
         model.train()
         optimizer = torch.optim.AdamW(model.parameters(), lr=opt.lr)
         
-        output, nce_loss, senti_aux_loss, js_loss, con_loss, cal_loss, _ = model(inputs, labels)
+        output, senti_aux_loss, L_PID, F_cons, F_conf, S, _ = model(inputs, labels)
         loss_fn = torch.nn.MSELoss()
-        loss = loss_fn(output, labels.view(-1, 1)) + 0.1 * nce_loss + 0.05 * senti_aux_loss + 0.1 * js_loss + 0.1 * con_loss + 0.1 * cal_loss
+        loss_re = loss_fn(output, labels.view(-1, 1))
+        dist_intra = (F_conf - F_cons).norm(dim=-1)
+        L_push = F.relu(1.0 - dist_intra).mean()
+        L_ortho = (F_conf.T @ F_cons).pow(2).sum()
+        loss = loss_re + 0.05 * senti_aux_loss + 0.05 * L_PID + 0.1 * L_push + 0.01 * L_ortho
         
         loss.backward()
         optimizer.step()
@@ -107,18 +110,15 @@ def test_phase1_baseline():
 
 def test_phase2_conflict_js():
     """
-    测试Phase 2: ConflictJS模块是否能正常运行
+    测试Phase 2: PID + 双分支模块是否能正常运行
     """
     print("\n" + "="*60)
-    print("Testing Phase 2 Conflict-JS Module")
+    print("Testing Phase 2 PID + Dual-Branch Module")
     print("="*60)
     
     opt = parse_opts()
     opt.use_ki = False
     opt.use_cmvn = True
-    opt.use_conflict_js = True
-    opt.use_routing = False  # 先测试不带路由
-    opt.use_vision_pruning = False
     opt.batch_size = 4
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -144,25 +144,17 @@ def test_phase2_conflict_js():
         }
         
         with torch.no_grad():
-            output, nce_loss, senti_aux_loss, js_loss, con_loss, cal_loss, _ = model(inputs, None)
+            output, senti_aux_loss, L_PID, F_cons, F_conf, S, _ = model(inputs, None)
             
-            # 检查是否生成了冲突强度
-            if hasattr(model, 'last_conflict_intensity'):
-                C = model.last_conflict_intensity
-                print(f"Conflict intensity C: shape={C.shape}, mean={C.mean().item():.4f}")
-                print(f"C range: [{C.min().item():.4f}, {C.max().item():.4f}]")
-                
-                # 检查证据masks
-                if hasattr(model, 'last_con_masks'):
-                    for m in ['T', 'A', 'V']:
-                        con_count = model.last_con_masks[m].sum(dim=1).float().mean().item()
-                        conf_count = model.last_conf_masks[m].sum(dim=1).float().mean().item()
-                        print(f"{m} - Congruent tokens: {con_count:.1f}, Conflict tokens: {conf_count:.1f}")
-                
-                print("\n✅ Phase 2 Conflict-JS test PASSED!")
+            # 检查是否生成了协同度 S (PID 输出) 与双分支特征
+            if S is not None:
+                print(f"Synergy S: shape={S.shape}, mean={S.mean().item():.4f}")
+                print(f"S range: [{S.min().item():.4f}, {S.max().item():.4f}]")
+                print(f"F_cons shape: {F_cons.shape}, F_conf shape: {F_conf.shape}")
+                print("\n✅ Phase 2 PID + dual-branch test PASSED!")
                 return True
             else:
-                print("❌ Conflict intensity not recorded")
+                print("❌ Synergy S not returned")
                 return False
                 
     except Exception as e:

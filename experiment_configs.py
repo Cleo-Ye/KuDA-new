@@ -142,7 +142,7 @@ HYPERPARAMETER_SEARCH = {
 # 数据集配置
 DATASET_CONFIGS = {
     'sims': {
-        'dataPath': '/18T/yechenlu/MSA_datasets/SIMS-v2/ch-sims2s/unaligned.pkl',
+        'dataPath': '/18T/yechenlu/MSA_datasets/SIMS/Processed/unaligned_39.pkl',
         'seq_lens': [50, 55, 400],
         'fea_dims': [768, 177, 25],
         'bert_pretrained': './pretrainedModel/BERT/bert-base-chinese'
@@ -154,13 +154,13 @@ DATASET_CONFIGS = {
         'bert_pretrained': './pretrainedModel/BERT/bert-base-chinese'
     },
     'mosi': {
-        'dataPath': 'path_to_mosi.pkl',
+        'dataPath': '/18T/yechenlu/MSA_datasets/MOSI/Processed/unaligned_50.pkl',
         'seq_lens': [50, 500, 500],  # 需要根据实际数据调整
         'fea_dims': [768, 709, 33],
         'bert_pretrained': './pretrainedModel/BERT/bert-base-uncased'
     },
     'mosei': {
-        'dataPath': 'path_to_mosei.pkl',
+        'dataPath': '/18T/yechenlu/MSA_datasets/MOSEI/Processed/unaligned_50.pkl',
         'seq_lens': [50, 500, 500],
         'fea_dims': [768, 709, 33],
         'bert_pretrained': './pretrainedModel/BERT/bert-base-uncased'

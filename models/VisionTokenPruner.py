@@ -98,8 +98,9 @@ class TextGuidedVisionPruner(nn.Module):
             score_drop = score_v[b, drop_idx]  # [L_drop]
 
             # cosine similarity: V_drop @ V_keep^T (normalized)
-            V_keep_n = F.normalize(V_keep, dim=-1)
-            V_drop_n = F.normalize(V_drop, dim=-1)
+            eps = 1e-8
+            V_keep_n = V_keep / (V_keep.norm(dim=-1, keepdim=True).clamp(min=eps))
+            V_drop_n = V_drop / (V_drop.norm(dim=-1, keepdim=True).clamp(min=eps))
             sim = torch.mm(V_drop_n, V_keep_n.t())  # [L_drop, K]
             assign = sim.argmax(dim=1)  # [L_drop], each in [0, K-1]
 
@@ -110,7 +111,8 @@ class TextGuidedVisionPruner(nn.Module):
                 if members.numel() > 0:
                     weights = F.softmax(score_drop[members], dim=0)
                     merged = (V_drop[members] * weights.unsqueeze(-1)).sum(dim=0)
-                    V_merge[k] = F.normalize(V_merge[k] + merged, dim=-1)
+                    v = V_merge[k] + merged
+                    V_merge[k] = v / (v.norm().clamp(min=eps))
             hidden_v_new_list.append(V_merge)
 
         # 填充到相同长度

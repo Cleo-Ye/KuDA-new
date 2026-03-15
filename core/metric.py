@@ -1,7 +1,22 @@
 import numpy as np
 from sklearn.metrics import accuracy_score, f1_score
 
-__all__ = ['MetricsTop']
+__all__ = ['MetricsTop', 'sims_binary_metrics_from_logits']
+
+
+def sims_binary_metrics_from_logits(logit_cls, y_true):
+    """
+    用分类头 logit_cls 与连续标签计算 Acc-2 / F1（SIMS 约定：label>0 为正类）。
+    用于对比「回归头二值化」与「分类头」的 F1，便于提升 F1 时调参。
+    """
+    logits = logit_cls.view(-1).cpu().detach().numpy()
+    truth = y_true.view(-1).cpu().detach().numpy()
+    truth = np.clip(truth, -1.0, 1.0)
+    binary_pred = (logits > 0).astype(int)
+    binary_truth = (truth > 0).astype(int)
+    acc2 = np.mean(binary_pred == binary_truth)
+    f1 = f1_score(binary_pred, binary_truth, average="weighted")
+    return {"F1_score_cls": round(f1, 4), "Mult_acc_2_cls": round(acc2, 4)}
 
 
 class MetricsTop():
@@ -26,6 +41,14 @@ class MetricsTop():
     def __eval_mosei_regression(self, y_pred, y_true, exclude_zero=False):
         test_preds = y_pred.view(-1).cpu().detach().numpy()
         test_truth = y_true.view(-1).cpu().detach().numpy()
+        # 过滤 NaN/Inf，避免 sklearn 报错
+        valid = np.isfinite(test_preds) & np.isfinite(test_truth)
+        if valid.sum() == 0:
+            return {"MAE": float('nan'), "Corr": float('nan'), "Has0_acc_2": float('nan'),
+                    "Has0_F1_score": float('nan'), "Non0_acc_2": float('nan'), "Non0_F1_score": float('nan'),
+                    "Mult_acc_5": float('nan'), "Mult_acc_7": float('nan')}
+        test_preds = test_preds[valid]
+        test_truth = test_truth[valid]
 
         test_preds_a7 = np.clip(test_preds, a_min=-3., a_max=3.)
         test_truth_a7 = np.clip(test_truth, a_min=-3., a_max=3.)
@@ -70,6 +93,13 @@ class MetricsTop():
     def __eval_sims_regression(self, y_pred, y_true):
         test_preds = y_pred.view(-1).cpu().detach().numpy()
         test_truth = y_true.view(-1).cpu().detach().numpy()
+        # 过滤 NaN/Inf，避免 sklearn 报错
+        valid = np.isfinite(test_preds) & np.isfinite(test_truth)
+        if valid.sum() == 0:
+            return {"MAE": float('nan'), "Corr": float('nan'), "Mult_acc_2": float('nan'),
+                    "Mult_acc_3": float('nan'), "Mult_acc_5": float('nan'), "F1_score": float('nan')}
+        test_preds = test_preds[valid]
+        test_truth = test_truth[valid]
         test_preds = np.clip(test_preds, a_min=-1., a_max=1.)
         test_truth = np.clip(test_truth, a_min=-1., a_max=1.)
 

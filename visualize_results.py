@@ -608,15 +608,18 @@ def visualize_evidence_summary_table(stats, save_dir):
 
     rows = []
     for m, name in zip(modalities, modality_names):
-        con = stats['con_counts'][m]
-        conf = stats['conf_counts'][m]
+        con = np.array(stats['con_counts'][m])
+        conf = np.array(stats['conf_counts'][m])
         total = stats['seq_lens'].get(m, 1)
+        # 显示 mean±std 与占比，便于观察跨样本差异（topk 配额下各样本约 conf_ratio/con_ratio，此处 std 反映序列长度等差异）
+        conf_pct = conf.mean() / total * 100
+        con_pct = con.mean() / total * 100
+        neu_pct = max(100 - conf_pct - con_pct, 0)
         rows.append([
-            name, total,
-            f'{conf.mean():.1f} ({conf.mean()/total*100:.1f}%)',
-            f'{con.mean():.1f} ({con.mean()/total*100:.1f}%)',
-            f'{max(total - conf.mean() - con.mean(), 0):.1f} '
-            f'({max(100 - conf.mean()/total*100 - con.mean()/total*100, 0):.1f}%)',
+            name, str(total),
+            f'{conf.mean():.1f}±{conf.std():.1f} ({conf_pct:.1f}%)',
+            f'{con.mean():.1f}±{con.std():.1f} ({con_pct:.1f}%)',
+            f'{max(total - conf.mean() - con.mean(), 0):.1f} ({neu_pct:.1f}%)',
         ])
 
     # Add C stats
@@ -626,7 +629,7 @@ def visualize_evidence_summary_table(stats, save_dir):
         rows.append(['C (overall)', '', f'mean={C.mean():.4f}', f'std={C.std():.4f}',
                      f'range=[{C.min():.4f},{C.max():.4f}]'])
 
-    fig, ax = plt.subplots(figsize=(14, 3))
+    fig, ax = plt.subplots(figsize=(14, 4))
     ax.axis('off')
     col_labels = ['Modality', 'Seq Len', 'Conflict Evidence', 'Congruent Evidence', 'Neutral']
     table = ax.table(cellText=rows, colLabels=col_labels, loc='center',
@@ -635,7 +638,8 @@ def visualize_evidence_summary_table(stats, save_dir):
     table.set_fontsize(10)
     table.scale(1.0, 1.5)
 
-    plt.title('Evidence Split Summary', fontsize=14, pad=20)
+    title = 'Evidence Split Summary (Conflict/Congruent from topk quota; mean±std across samples)'
+    plt.title(title, fontsize=12, pad=20)
     save_path = os.path.join(save_dir, 'evidence_summary_table.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
@@ -651,19 +655,26 @@ def visualize_gate_behavior(stats, save_dir):
     回答审稿人质疑: "路由真的发生了吗？门控是否跟随冲突强度变化？"
 
     图表包含:
-    - 左: C vs conf_weight 散点图 + 分箱均值折线（带 std 误差棒）
+    - 左: C vs conf_weight 散点图 + 分位数分箱均值折线（带 std 误差棒）
     - 右: per-modality alpha (α_T/V/A) 随 C 的分箱均值
+    使用分位数分箱避免 C 分布集中时某些 bin 样本过少。
     """
     os.makedirs(save_dir, exist_ok=True)
-    C = stats['C']
-    gate_w = stats['gate_weights']
+    C = np.array(stats['C'])
+    gate_w = np.array(stats['gate_weights'])
     if len(C) == 0 or len(gate_w) == 0:
         print("Warning: No gate weights recorded. Make sure use_conflict_js=True and model ran a forward pass.")
         return
 
     n_bins = 5
-    bin_edges = np.linspace(C.min(), C.max() + 1e-8, n_bins + 1)
-    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
+    # 分位数分箱：每箱样本数接近，避免 C 分布集中时等间距分箱导致空箱或曲线失真
+    bin_edges = np.percentile(C, np.linspace(0, 100, n_bins + 1))
+    bin_edges[-1] = bin_edges[-1] + 1e-8
+    bin_centers = np.array([
+        C[(C >= bin_edges[i]) & (C < bin_edges[i + 1])].mean()
+        if ((C >= bin_edges[i]) & (C < bin_edges[i + 1])).sum() > 0 else np.nan
+        for i in range(n_bins)
+    ])
 
     # 分箱统计 conf_weight
     bin_means, bin_stds, bin_counts = [], [], []
@@ -684,24 +695,30 @@ def visualize_gate_behavior(stats, save_dir):
     ax = axes[0]
     sc = ax.scatter(C, gate_w, c=C, cmap='RdYlBu_r', alpha=0.35, s=10, edgecolors='none')
     plt.colorbar(sc, ax=ax, label='C')
-    ax.errorbar(bin_centers, bin_means, yerr=bin_stds, fmt='o-',
-                color='black', linewidth=2, markersize=7, capsize=5, label='Bin mean ± std')
+    valid_bin = ~np.isnan(bin_centers)
+    if valid_bin.any():
+        ax.errorbar(bin_centers[valid_bin], np.array(bin_means)[valid_bin],
+                    yerr=np.array(bin_stds)[valid_bin], fmt='o-',
+                    color='black', linewidth=2, markersize=7, capsize=5, label='Bin mean ± std (quantile bins)')
     ax.set_xlabel('Conflict Intensity C', fontsize=12)
     ax.set_ylabel('Gate Weight (conf_weight α)', fontsize=12)
     ax.set_title('Gate Behavior: α vs Conflict Intensity C', fontsize=13)
     ax.legend(fontsize=10)
     ax.grid(alpha=0.3)
     corr = np.corrcoef(C, gate_w)[0, 1] if len(C) > 1 else 0.0
-    ax.text(0.05, 0.95, f'Pearson r = {corr:.4f}', transform=ax.transAxes,
-            fontsize=11, verticalalignment='top',
+    c_text = f'Pearson r = {corr:.4f}\nC: μ={C.mean():.3f}, σ={C.std():.3f}\nα: μ={gate_w.mean():.3f}, σ={gate_w.std():.3f}'
+    if C.std() < 0.05 or gate_w.std() < 0.05:
+        c_text += '\n(Low variance: check C/gate range)'
+    ax.text(0.05, 0.95, c_text, transform=ax.transAxes,
+            fontsize=10, verticalalignment='top',
             bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
-    # 右图（如有）：per-modality alpha
+    # 右图（如有）：per-modality alpha（仅绘制有效 bin）
     if has_alpha:
         ax2 = axes[1]
         colors = {'T': '#2ECC71', 'V': '#9B59B6', 'A': '#3498DB'}
         for m in ['T', 'V', 'A']:
-            alpha_vals = stats['gate_alpha'][m]
+            alpha_vals = np.array(stats['gate_alpha'][m])
             if len(alpha_vals) == 0:
                 continue
             m_means, m_stds = [], []
@@ -710,9 +727,11 @@ def visualize_gate_behavior(stats, save_dir):
                 vals = alpha_vals[mask]
                 m_means.append(vals.mean() if len(vals) > 0 else np.nan)
                 m_stds.append(vals.std() if len(vals) > 1 else 0.0)
-            ax2.errorbar(bin_centers, m_means, yerr=m_stds, fmt='o-',
+            m_means = np.array(m_means)
+            m_stds = np.array(m_stds)
+            ax2.errorbar(bin_centers[valid_bin], m_means[valid_bin], yerr=m_stds[valid_bin], fmt='o-',
                          color=colors[m], linewidth=2, markersize=7, capsize=4, label=f'α_{m}')
-        ax2.set_xlabel('Conflict Intensity C (binned)', fontsize=12)
+        ax2.set_xlabel('Conflict Intensity C (quantile binned)', fontsize=12)
         ax2.set_ylabel('Per-modality Gate α', fontsize=12)
         ax2.set_title('Per-modality Gate α by Conflict Bin', fontsize=13)
         ax2.legend(fontsize=10)

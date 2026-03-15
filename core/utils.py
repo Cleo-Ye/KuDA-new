@@ -84,8 +84,9 @@ def save_print_results(opt, logger, train_re, valid_re, test_re):
         ]
         headers = ["Phase", "MAE", "Corr", "Acc-7", "Acc-2", "Acc-2-N0", "F1", "F1-N0"]
 
-        table = '\n' + tabulate(results, headers, tablefmt="grid") + '\n'
-        logger.info(table.replace('\n', '\n\n'))
+        # 使用简洁的文本表格格式（无边框），更接近原 KuDA 日志风格
+        table = '\n' + tabulate(results, headers, tablefmt="simple", floatfmt=".4f") + '\n'
+        logger.info(table)
     else:
         results = [
             ["Train", train_re["MAE"], train_re["Corr"], train_re["Mult_acc_2"], train_re["Mult_acc_3"], train_re["Mult_acc_5"], train_re["F1_score"]],
@@ -94,9 +95,9 @@ def save_print_results(opt, logger, train_re, valid_re, test_re):
         ]
         headers = ["Phase", "MAE", "Corr", "Acc-2", "Acc-3", "Acc-5", "F1"]
 
-        table = '\n' + tabulate(results, headers, tablefmt="grid") + '\n'
+        table = '\n' + tabulate(results, headers, tablefmt="simple", floatfmt=".4f") + '\n'
         if logger is not None:
-            logger.info(table.replace('\n', '\n\n'))
+            logger.info(table)
         else:
             print(table)
 

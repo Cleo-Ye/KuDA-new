@@ -39,6 +39,17 @@ class MMDataset(Dataset):
         self.vision = data[self.mode]['vision'].astype(np.float32)
         self.audio = data[self.mode]['audio'].astype(np.float32)
 
+        # 动态同步特征维度，避免 fea_dims 与真实特征维度不一致导致 Linear 输入维度错误
+        # 形状约定: text [B, L_t, D_t], vision [B, L_v, D_v], audio [B, L_a, D_a]
+        try:
+            text_dim = int(self.text.shape[-1])
+            vision_dim = int(self.vision.shape[-1])
+            audio_dim = int(self.audio.shape[-1])
+            self.args.fea_dims = [text_dim, vision_dim, audio_dim]
+        except Exception:
+            # 若遇到非标准形状（例如某模态不存在），保持原 fea_dims，不中断训练
+            pass
+
         self.rawText = data[self.mode]['raw_text']
         self.ids = data[self.mode]['id']
         self.labels = {
@@ -52,13 +63,14 @@ class MMDataset(Dataset):
             self.audio_lengths = data[self.mode]['audio_lengths']
             self.vision_lengths = data[self.mode]['vision_lengths']
 
-        # Clear dirty data
-        self.audio[self.audio == -np.inf] = 0
-        self.vision[self.vision == -np.inf] = 0
-        
-        # Phase 1: 添加音频CMVN(Cepstral Mean and Variance Normalization)
+        # Clear dirty data: remove NaN, +inf, -inf
+        self.audio[~np.isfinite(self.audio)] = 0
+        self.vision[~np.isfinite(self.vision)] = 0
+
+        # Phase 1: CMVN for both audio and vision
         if self.args.use_cmvn:
             self._apply_audio_cmvn()
+            self._apply_vision_cmvn()
 
         self.__gen_mask(data[self.mode])
         if self.args.need_truncated:
@@ -169,14 +181,26 @@ class MMDataset(Dataset):
         for i in range(len(self.audio)):
             valid_len = self.audio_lengths[i]
             if valid_len > 0:
-                audio_valid = self.audio[i, :valid_len, :]  # 只处理有效部分
-                
-                # 计算均值和标准差
-                mean = audio_valid.mean(axis=0, keepdims=True)  # [1, feat_dim]
-                std = audio_valid.std(axis=0, keepdims=True) + 1e-8  # 避免除零
-                
-                # Z-score归一化
+                audio_valid = self.audio[i, :valid_len, :]
+                mean = audio_valid.mean(axis=0, keepdims=True)
+                std = audio_valid.std(axis=0, keepdims=True) + 1e-8
                 self.audio[i, :valid_len, :] = (audio_valid - mean) / std
+
+    def _apply_vision_cmvn(self):
+        """
+        对视觉特征应用 CMVN：对每条样本的有效帧做 z-score 归一化。
+        SIMS 视觉特征维度为 709，数值范围可能非常大，不归一化极易导致 Transformer 溢出。
+        """
+        for i in range(len(self.vision)):
+            valid_len = self.vision_lengths[i]
+            if valid_len > 0:
+                vis_valid = self.vision[i, :valid_len, :]
+                mean = vis_valid.mean(axis=0, keepdims=True)
+                std = vis_valid.std(axis=0, keepdims=True) + 1e-8
+                normalized = (vis_valid - mean) / std
+                # 再 clamp 防止极端离群点
+                normalized = np.clip(normalized, -10.0, 10.0)
+                self.vision[i, :valid_len, :] = normalized
 
     def __getitem__(self, index):
         sample = {

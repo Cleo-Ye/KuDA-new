@@ -15,16 +15,17 @@
 #   bash run_full_experiments.sh 40           # 40 epoch
 #   bash run_full_experiments.sh 50 2,3,4,5,6,7  # 指定 GPU
 #   bash run_full_experiments.sh summary      # 仅打印测试集汇总（不训练）
+#   bash run_full_experiments.sh viz [gpu_ids]# 六组配置依次跑可视化
 # ============================================================
 
 CONDA_ENV="${CONDA_ENV:-kuda}"
 
-# 参数解析: [epochs] [gpu_ids] 或 [train|summary]
+# 参数解析: [epochs] [gpu_ids] 或 [train|summary|viz]
 # 默认: 50 epoch（完整实验）, 后六块 GPU 2,3,4,5,6,7
-if [ "$1" = "summary" ] || [ "$1" = "train" ]; then
+if [ "$1" = "summary" ] || [ "$1" = "train" ] || [ "$1" = "viz" ]; then
     CMD="$1"
     N_EPOCHS=50
-    GPU_IDS="2,3,4,5,6,7"
+    GPU_IDS="${2:-2,3,4,5,6,7}"
 else
     N_EPOCHS="${1:-50}"
     GPU_IDS="${2:-2,3,4,5,6,7}"
@@ -46,6 +47,7 @@ mkdir -p logs/full_multi
 
 # 实验配置: NAME|EXTRA_ARGS
 # 注意：全部使用原始参数，确保稳定性
+# +ICR_only 在未压缩 token 上做 ICR，C 易被稀释，可能差于 baseline，用于支撑「先 IEC 再 ICR」的串行设计
 EXPERIMENTS=(
     "baseline|--use_conflict_js False --use_vision_pruning False"
     "+IEC_r05|--use_conflict_js False --use_vision_pruning True --iec_mode text_guided --vision_keep_ratio 0.5"
@@ -145,6 +147,37 @@ run_summary() {
     fi
 }
 
+# 对六组配置分别跑可视化（可指定 GPU 列表，按顺序轮询）
+run_viz() {
+    echo ""
+    echo "============================================================"
+    echo "Full Experiments Visualization (6 configs)"
+    echo "============================================================"
+    IFS=',' read -ra GPUS_VIZ <<< "$GPU_IDS"
+    N_GPUS_VIZ=${#GPUS_VIZ[@]}
+    i=0
+    for exp in "${EXPERIMENTS[@]}"; do
+        IFS='|' read -r NAME EXTRA <<< "$exp"
+        CKPT="./checkpoints/full_${NAME}/best.pth"
+        VIZ_DIR="./results/visualizations/full_${NAME}"
+        GPU_ID=${GPUS_VIZ[$((i % N_GPUS_VIZ))]}
+        if [ -f "$CKPT" ]; then
+            echo "=== [Viz] ${NAME} (GPU ${GPU_ID}) -> ${VIZ_DIR} ==="
+            CUDA_VISIBLE_DEVICES=$GPU_ID conda run --no-capture-output -n $CONDA_ENV python -u visualize_results.py \
+                --datasetName sims \
+                --checkpoint_path "$CKPT" \
+                --save_dir "$VIZ_DIR" \
+                2>&1 | tee "logs/full_multi/viz_${NAME}.log"
+            echo "  Done -> ${VIZ_DIR}"
+        else
+            echo "[SKIP] ${NAME}: checkpoint not found at ${CKPT}"
+        fi
+        ((i++))
+    done
+    echo ""
+    echo "All visualizations done. Results under ./results/visualizations/full_*"
+}
+
 case "$CMD" in
     train)
         run_train
@@ -152,8 +185,11 @@ case "$CMD" in
     summary)
         run_summary
         ;;
+    viz)
+        run_viz
+        ;;
     *)
-        echo "Usage: bash run_full_experiments.sh [epochs] [gpu_ids] [train|summary]"
+        echo "Usage: bash run_full_experiments.sh [epochs] [gpu_ids] [train|summary|viz]"
         echo "  epochs: 默认 50（完整实验），可调整为 30/40 等"
         echo "  gpu_ids: 默认 2,3,4,5,6,7（后六块 GPU，避免占用 0、1 号）"
         echo ""
@@ -169,6 +205,10 @@ case "$CMD" in
         echo ""
         echo "  # 仅打印测试集汇总（不训练）"
         echo "  bash run_full_experiments.sh summary"
+        echo ""
+        echo "  # 对六组配置跑可视化（默认 GPU 2,3,4,5,6,7）"
+        echo "  bash run_full_experiments.sh viz"
+        echo "  bash run_full_experiments.sh viz 0,1,2,3,4,5"
         echo ""
         echo "  # 训练后查看进度"
         echo "  watch -n 10 'grep \"Best-MAE\" logs/full_multi/*.log | tail -12'"
