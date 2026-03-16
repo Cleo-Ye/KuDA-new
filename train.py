@@ -49,6 +49,8 @@ def apply_dataset_config(opt_arg):
         opt_arg.seq_lens = list(cfg["seq_lens"])
     if "fea_dims" in cfg:
         opt_arg.fea_dims = list(cfg["fea_dims"])
+    if "text_encoder_pretrained" in cfg:
+        opt_arg.text_encoder_pretrained = cfg["text_encoder_pretrained"]
     return opt_arg
 
 
@@ -76,6 +78,33 @@ def get_dims_from_pkl(opt_arg):
 
 
 opt = apply_dataset_config(opt)
+
+
+def _is_grcf_stage2(opt_arg, epoch):
+    """是否处于 GRCF Stage2（冻结 backbone，仅 MAE 校准回归头）"""
+    if not getattr(opt_arg, 'use_grcf', False):
+        return False
+    stage1 = getattr(opt_arg, 'grcf_stage1_epochs', 40)
+    return epoch > stage1
+
+
+def _freeze_backbone_for_grcf_stage2(model, opt_arg):
+    """GRCF Stage2: 冻结多模态特征提取与双分支，仅训练回归头"""
+    if getattr(opt_arg, 'model_type', '') != 'pid_dualpath':
+        return
+    trainable = ['main_head', 'aux_head_R', 'aux_head_S', 'cls_head']
+    n_frozen, n_train = 0, 0
+    for name, param in model.named_parameters():
+        is_head = any(h in name for h in trainable)
+        if is_head:
+            param.requires_grad = True
+            n_train += 1
+        else:
+            param.requires_grad = False
+            n_frozen += 1
+    print(f'[GRCF Stage2] Froze {n_frozen} params, training {n_train} (heads only)')
+
+
 if torch.cuda.is_available():
     torch.cuda.empty_cache()
     device = torch.device("cuda")
@@ -108,27 +137,69 @@ def main(parse_args):
 
     setup_seed(opt.seed)
     model = build_model(opt).to(device)
-    
+
+    # 可选：冻结 BERT（小数据集强烈推荐，与原 KuDA 一致）
+    freeze_bert = getattr(opt, 'freeze_bert', False)
+    if freeze_bert:
+        n = 0
+        for name, param in model.named_parameters():
+            if 'UniEncKI.enc_t.encoder.model' in name or 'enc_t.encoder.model' in name:
+                param.requires_grad = False
+                n += 1
+        logger.info(f'[freeze_bert=True] Froze {n} BERT parameter tensors.')
+    # 可选：冻结视觉/音频编码器，与原 KuDA「V/A 也全程冻结」一致
+    freeze_va = getattr(opt, 'freeze_vision_audio', False)
+    if freeze_va:
+        n = 0
+        for name, param in model.named_parameters():
+            if ('UniEncKI.enc_v.encoder' in name or 'UniEncKI.enc_a.encoder' in name) and param.requires_grad:
+                param.requires_grad = False
+                n += 1
+        logger.info(f'[freeze_vision_audio=True] Froze {n} vision/audio encoder parameter tensors.')
+
     dataLoader = MMDataLoader(opt)
-    # PID 估计器 / BatchPIDPrior 单独大学习率，避免协同度坍塌
+    # 参数分组：BERT / PID / 其他，分别设学习率
     model_type = getattr(opt, 'model_type', 'kmsa')
     pid_name = 'batch_pid_prior' if model_type == 'pid_dualpath' else 'pid_estimator'
-    pid_params = [p for n, p in model.named_parameters() if p.requires_grad and pid_name in n]
-    other_params = [p for n, p in model.named_parameters() if p.requires_grad and pid_name not in n]
-    pid_lr = getattr(opt, 'pid_lr', 1e-4)
-    if len(pid_params) > 0 and len(other_params) > 0:
-        optimizer = torch.optim.AdamW(
-            [{'params': other_params, 'lr': opt.lr}, {'params': pid_params, 'lr': pid_lr}],
-            weight_decay=opt.weight_decay
-        )
-    else:
-        optimizer = torch.optim.AdamW(
-            filter(lambda p: p.requires_grad, model.parameters()),
-            lr=opt.lr,
-            weight_decay=opt.weight_decay
-        )
+    bert_lr = getattr(opt, 'bert_lr', 0.0)
 
-    loss_fn = torch.nn.SmoothL1Loss(beta=0.5)  # Huber loss, beta=0.5 对 SIMS 标签范围 [-1,1] 合适
+    bert_params, pid_params, other_params = [], [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        is_bert = 'UniEncKI.enc_t.encoder.model' in name or 'enc_t.encoder.model' in name
+        is_pid = pid_name in name
+        if is_bert:
+            bert_params.append(param)
+        elif is_pid:
+            pid_params.append(param)
+        else:
+            other_params.append(param)
+
+    pid_lr = getattr(opt, 'pid_lr', 1e-4)
+    # 构建参数组：other + pid（若有）+ bert（若未冻结且 bert_lr>0）
+    param_groups = [{'params': other_params, 'lr': opt.lr}]
+    if pid_params:
+        param_groups.append({'params': pid_params, 'lr': pid_lr})
+    if bert_params:
+        effective_bert_lr = bert_lr if bert_lr > 0 else opt.lr
+        param_groups.append({'params': bert_params, 'lr': effective_bert_lr})
+        logger.info(f'BERT lr={effective_bert_lr:.2e}  main lr={opt.lr:.2e}  pid lr={pid_lr:.2e}')
+    else:
+        logger.info(f'main lr={opt.lr:.2e}  pid lr={pid_lr:.2e}  (BERT frozen)')
+
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=opt.weight_decay)
+
+    _loss_fn_name = getattr(opt, 'loss_fn', 'smoothl1').lower().strip()
+    if _loss_fn_name == 'l1':
+        loss_fn = torch.nn.L1Loss()
+    elif _loss_fn_name == 'mse':
+        loss_fn = torch.nn.MSELoss()
+    else:
+        loss_fn = torch.nn.SmoothL1Loss(beta=0.5)  # default: Huber loss
+    logger.info(f'loss_fn={_loss_fn_name}')
+    if getattr(opt, 'lambda_extreme', 0.0) > 0:
+        logger.info(f'extreme sample weighting: lambda_extreme={opt.lambda_extreme} (w=1+k*|y|)')
     metrics = MetricsTop().getMetics(opt.datasetName)
     scheduler_warmup = get_scheduler(optimizer, opt.n_epochs)
 
@@ -180,7 +251,12 @@ def main(parse_args):
             scheduler_warmup.step()
         logger.info(f'Resumed from {opt.resume}, epoch {start_epoch} -> will train to {opt.n_epochs}')
 
+    grcf_stage1 = getattr(opt, 'grcf_stage1_epochs', 40) if getattr(opt, 'use_grcf', False) else None
+
     for epoch in range(start_epoch + 1, opt.n_epochs + 1):
+        if grcf_stage1 is not None and epoch == grcf_stage1 + 1:
+            _freeze_backbone_for_grcf_stage2(model, opt)
+            logger.info(f'[GRCF] Entering Stage2 (epoch {epoch}): freeze backbone, MAE-only calibration')
         train_results = train(model, dataLoader['train'], optimizer, loss_fn, epoch, metrics)
         valid_results = evaluate(model, dataLoader['valid'], optimizer, loss_fn, epoch, metrics)
         test_results = test(model, dataLoader['test'], optimizer, loss_fn, epoch, metrics)
@@ -379,7 +455,25 @@ def train(model, train_loader, optimizer, loss_fn, epoch, metrics):
 
         if isinstance(raw_out, dict):
             # Route B loss: L_task + lambda_aux*L_aux + lambda_ortho*L_ortho + lambda_pid*L_pid + L_cls + senti_aux
-            loss_re = loss_fn(output, label)
+            # GRCF Stage2: 仅 loss_re + L_cls + senti_aux，冻结 backbone
+            in_stage2 = _is_grcf_stage2(opt, epoch)
+            reg_weight = getattr(opt, 'grcf_stage1_regression_weight', 1.0) if (getattr(opt, 'use_grcf', False) and not in_stage2) else 1.0
+
+            lambda_extreme = getattr(opt, 'lambda_extreme', 0.0)
+            if lambda_extreme > 0 and not in_stage2:
+                # 对极端样本(|y|大)加权，缓解预测向0收缩
+                _loss_name = getattr(opt, 'loss_fn', 'smoothl1').lower().strip()
+                if _loss_name == 'l1':
+                    loss_per = F.l1_loss(output, label, reduction='none').squeeze(-1)
+                elif _loss_name == 'mse':
+                    loss_per = F.mse_loss(output, label, reduction='none').squeeze(-1)
+                else:
+                    loss_per = F.smooth_l1_loss(output, label, beta=0.5, reduction='none').squeeze(-1)
+                w = 1.0 + lambda_extreme * label.abs().squeeze(-1)
+                loss_re = (w * loss_per).sum() / w.sum().clamp(min=1e-8)
+            else:
+                loss_re = loss_fn(output, label)
+            loss_re = reg_weight * loss_re
             lambda_classification = getattr(opt, 'lambda_classification', getattr(opt, 'lambda_cls', 0.0))
             target_binary = (label > 0).float().squeeze(-1)
             pos_weight = getattr(opt, 'cls_pos_weight', None)
@@ -393,29 +487,55 @@ def train(model, train_loader, optimizer, loss_fn, epoch, metrics):
             lambda_senti = getattr(opt, 'lambda_senti', 0.05)
             loss = loss + lambda_senti * senti_aux_loss
 
-            pid_warmup_epochs = getattr(opt, 'pid_warmup_epochs', 10)
-            pid_warmup = min(1.0, (epoch - 1) / max(pid_warmup_epochs, 1))
-            lambda_pid = getattr(opt, 'lambda_pid', 0.05)
-            loss = loss + pid_warmup * lambda_pid * aux_pid_loss
+            if not in_stage2:
+                pid_warmup_epochs = getattr(opt, 'pid_warmup_epochs', 10)
+                pid_warmup = min(1.0, (epoch - 1) / max(pid_warmup_epochs, 1))
+                lambda_pid = getattr(opt, 'lambda_pid', 0.05)
+                loss = loss + pid_warmup * lambda_pid * aux_pid_loss
 
-            # L_aux: per-sample weighted (alpha_r * L(pred_R) + alpha_s * L(pred_S)).mean()
-            L_aux_R = loss_fn(pred_R, label).squeeze(-1)   # [B]
-            L_aux_S = loss_fn(pred_S, label).squeeze(-1)
-            L_aux = (alpha_r.squeeze(-1) * L_aux_R + alpha_s.squeeze(-1) * L_aux_S).mean()
-            lambda_aux = getattr(opt, 'lambda_aux', 0.1)
-            loss = loss + lambda_aux * L_aux
+                # L_aux: per-sample weighted (alpha_r * L(pred_R) + alpha_s * L(pred_S))
+                L_aux_R = loss_fn(pred_R, label).squeeze(-1)   # [B]
+                L_aux_S = loss_fn(pred_S, label).squeeze(-1)
+                L_aux_per = alpha_r.squeeze(-1) * L_aux_R + alpha_s.squeeze(-1) * L_aux_S
+                if lambda_extreme > 0:
+                    L_aux = (w * L_aux_per).sum() / w.sum().clamp(min=1e-8)
+                else:
+                    L_aux = L_aux_per.mean()
+                lambda_aux = getattr(opt, 'lambda_aux', 0.1)
+                loss = loss + lambda_aux * L_aux
 
-            # L_ortho: 正交约束，F_R 与 F_S 余弦相似度绝对值均值（论文 3.6）
-            cos_sim = F.cosine_similarity(F_R, F_S, dim=1)
-            L_ortho = torch.mean(torch.abs(cos_sim))
-            lambda_ortho = getattr(opt, 'lambda_ortho', 0.005)
-            loss = loss + pid_warmup * lambda_ortho * L_ortho
+                # L_ortho: 正交约束，F_R 与 F_S 余弦相似度绝对值均值（论文 3.6）
+                cos_sim = F.cosine_similarity(F_R, F_S, dim=1)
+                L_ortho = torch.mean(torch.abs(cos_sim))
+                lambda_ortho = getattr(opt, 'lambda_ortho', 0.005)
+                loss = loss + pid_warmup * lambda_ortho * L_ortho
 
-            # L_alpha_var: 鼓励 alpha_s 在 batch 内具有方差，避免全部塌到 0.5（协同路径真正参与）
-            lambda_alpha_var = getattr(opt, 'lambda_alpha_var', 0.05)
-            if lambda_alpha_var > 0 and alpha_s.size(0) >= 2:
-                L_alpha_var = -alpha_s.squeeze(-1).var()
-                loss = loss + pid_warmup * lambda_alpha_var * L_alpha_var
+                # L_alpha_var: 鼓励 alpha_s 在 batch 内具有方差，避免全部塌到 0.5（协同路径真正参与）
+                lambda_alpha_var = getattr(opt, 'lambda_alpha_var', 0.05)
+                if lambda_alpha_var > 0 and alpha_s.size(0) >= 2:
+                    L_alpha_var = -alpha_s.squeeze(-1).var()
+                    loss = loss + pid_warmup * lambda_alpha_var * L_alpha_var
+
+                # L_rank: Pairwise Ranking Regularization (MPR)，缓解预测收缩/均值回归
+                # 动态 Margin (CrossSent): margin=gamma*(y_i-y_j)，避免与 MAE 硬冲突
+                lambda_rank = getattr(opt, 'lambda_rank', 0.0)
+                if lambda_rank > 0 and output.size(0) >= 2:
+                    pred_flat = output.squeeze(-1)  # [B]
+                    label_flat = label.squeeze(-1)  # [B]
+                    thresh = getattr(opt, 'ranking_threshold', 0.1)
+                    y_i = label_flat.unsqueeze(1)
+                    y_j = label_flat.unsqueeze(0)
+                    valid = (y_i > y_j) & ((y_i - y_j) > thresh)
+                    if valid.any():
+                        pred_i = pred_flat.unsqueeze(1)
+                        pred_j = pred_flat.unsqueeze(0)
+                        use_dynamic = getattr(opt, 'use_dynamic_margin_rank', True)
+                        if use_dynamic:
+                            margin = getattr(opt, 'rank_margin_gamma', 0.6) * (y_i - y_j)
+                        else:
+                            margin = getattr(opt, 'rank_margin', 0.2)
+                        L_rank = (valid.float() * F.relu(margin - (pred_i - pred_j))).sum() / valid.sum().clamp(min=1)
+                        loss = loss + pid_warmup * lambda_rank * L_rank
 
             # Synergy S = alpha_s（协同路径权重）；冗余 R = alpha_r
             S_collect.append(alpha_s.detach().cpu())
@@ -457,6 +577,22 @@ def train(model, train_loader, optimizer, loss_fn, epoch, metrics):
                 S_flat = S.squeeze()
                 L_S_diverse = ((S_flat - target_S) ** 2).mean()
                 loss = loss + pid_warmup * lambda_S_diverse * L_S_diverse
+
+            # L_rank: Pairwise Ranking (MPR)，动态 margin 缓解与 MAE 冲突
+            lambda_rank = getattr(opt, 'lambda_rank', 0.0)
+            in_stage2 = _is_grcf_stage2(opt, epoch)
+            if lambda_rank > 0 and not in_stage2 and output.size(0) >= 2:
+                pred_flat = output.squeeze(-1)
+                label_flat = label.squeeze(-1)
+                thresh = getattr(opt, 'ranking_threshold', 0.1)
+                y_i, y_j = label_flat.unsqueeze(1), label_flat.unsqueeze(0)
+                valid = (y_i > y_j) & ((y_i - y_j) > thresh)
+                if valid.any():
+                    pred_i, pred_j = pred_flat.unsqueeze(1), pred_flat.unsqueeze(0)
+                    use_dynamic = getattr(opt, 'use_dynamic_margin_rank', True)
+                    margin = getattr(opt, 'rank_margin_gamma', 0.6) * (y_i - y_j) if use_dynamic else getattr(opt, 'rank_margin', 0.2)
+                    L_rank = (valid.float() * F.relu(margin - (pred_i - pred_j))).sum() / valid.sum().clamp(min=1)
+                    loss = loss + pid_warmup * lambda_rank * L_rank
 
             if getattr(opt, 'ablation_single_branch', False):
                 lambda_diff = 0.0

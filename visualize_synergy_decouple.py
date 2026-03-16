@@ -38,7 +38,26 @@ def collect_synergy_and_features(model, dataloader, device, max_samples=None):
                 }
             }
             label = data['labels']['M'].to(device)
-            pred, _, _, F_cons, F_conf, S, _ = model(inputs, None)
+            out = model(inputs, None)
+            # 兼容新旧接口：
+            # - 旧版本: model 返回 (pred, ..., F_cons, F_conf, S, ...)
+            # - 新版本: model 返回 dict，键包含 'pred', 'F_R', 'F_S', 'alpha_s' 等
+            if isinstance(out, dict):
+                pred = out['pred']
+                # 约定: F_S 视为 Synergy / consistent 分支, F_R 视为 redundant / conflict 分支
+                F_cons = out.get('F_S', out.get('F_R'))
+                F_conf = out.get('F_R', out.get('F_S'))
+                alpha_s = out.get('alpha_s')
+                if alpha_s is None:
+                    raise ValueError("Model output dict missing 'alpha_s' for Synergy visualization.")
+                # alpha_s: [B, L] 或 [B, 1] -> 统一聚合为 [B]
+                if alpha_s.dim() > 1:
+                    S = alpha_s.mean(dim=1)
+                else:
+                    S = alpha_s.view(-1)
+            else:
+                # 向后兼容旧 tuple 接口
+                pred, _, _, F_cons, F_conf, S, _ = out
 
             b = pred.size(0)
             S_list.append(S.cpu().numpy())

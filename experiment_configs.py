@@ -140,12 +140,18 @@ HYPERPARAMETER_SEARCH = {
 
 
 # 数据集配置
+# 使用 RoBERTa pkl 时，text_encoder_pretrained 必须与 build_roberta_text_pkl 的 --pretrained 一致
 DATASET_CONFIGS = {
     'sims': {
+        # BERT 版本（与 bert-base-chinese 兼容）
         'dataPath': '/18T/yechenlu/MSA_datasets/SIMS/Processed/unaligned_39.pkl',
+        # RoBERTa 版本（需与 build_roberta_text_pkl 的 tokenizer 一致，如 hfl/chinese-roberta-wwm-ext）
+        # 'dataPath': '/18T/yechenlu/MSA_datasets/SIMS/Processed/unaligned_39_roberta.pkl',
         'seq_lens': [50, 55, 400],
         'fea_dims': [768, 177, 25],
-        'bert_pretrained': './pretrainedModel/BERT/bert-base-chinese'
+        'bert_pretrained': './pretrainedModel/BERT/bert-base-chinese',
+        # RoBERTa pkl 时使用，需与 pkl 生成时的 tokenizer 一致
+        'text_encoder_pretrained': 'hfl/chinese-roberta-wwm-ext',
     },
     'simsv2': {
         'dataPath': '/18T/yechenlu/MSA_datasets/SIMS-v2/ch-sims2s/unaligned.pkl',

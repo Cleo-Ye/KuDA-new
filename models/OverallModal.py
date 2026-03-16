@@ -117,8 +117,13 @@ class KMSA(nn.Module):
 
 
 def build_model(opt):
+    # RoBERTa pkl 时使用 text_encoder_pretrained，否则用 BERT
+    data_path = str(getattr(opt, 'dataPath', ''))
     if 'sims' in opt.datasetName:
-        l_pretrained = './pretrainedModel/BERT/bert-base-chinese'
+        if 'roberta' in data_path.lower():
+            l_pretrained = getattr(opt, 'text_encoder_pretrained', 'hfl/chinese-roberta-wwm-ext')
+        else:
+            l_pretrained = './pretrainedModel/BERT/bert-base-chinese'
     else:
         l_pretrained = './pretrainedModel/BERT/bert-base-uncased'
     model_type = getattr(opt, 'model_type', 'kmsa')

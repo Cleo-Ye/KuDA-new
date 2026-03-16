@@ -2,7 +2,7 @@ import copy
 import torch
 from torch import nn, einsum
 from torch.nn import TransformerEncoderLayer, TransformerEncoder
-from transformers import BertConfig, BertModel, BertTokenizer
+from transformers import AutoConfig, AutoModel, AutoTokenizer
 
 
 def _sanitize_key_padding_mask(mask, device=None):
@@ -118,17 +118,18 @@ class UniEncoder(nn.Module):
             )
             self.layernorm = nn.LayerNorm(dim_feedforward)
         else:
-            self.model_config = BertConfig.from_pretrained(
+            # 使用 AutoModel/AutoTokenizer 支持 BERT、RoBERTa、chinese-roberta-wwm-ext 等
+            # 需与 pkl 生成时的 tokenizer 一致
+            self.model_config = AutoConfig.from_pretrained(
                 pretrained,
                 output_hidden_states=True,
                 cache_dir=self.hf_cache_dir
             )
-            self.tokenizer = BertTokenizer.from_pretrained(
+            self.tokenizer = AutoTokenizer.from_pretrained(
                 pretrained,
-                do_lower_case=True,
                 cache_dir=self.hf_cache_dir
             )
-            self.model = BertModel.from_pretrained(
+            self.model = AutoModel.from_pretrained(
                 pretrained,
                 config=self.model_config,
                 cache_dir=self.hf_cache_dir
