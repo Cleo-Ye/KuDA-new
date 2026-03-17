@@ -24,13 +24,26 @@ class BatchPIDPrior(nn.Module):
         self.register_buffer('r_global_buf', torch.tensor(0.5))
         self.register_buffer('s_global_buf', torch.tensor(0.5))
 
-    def forward(self, H_T, H_V, H_A, labels):
+    def forward(self, H_T, H_V, H_A, labels, epoch=None, warmup_epochs=0):
         """
         H_T, H_V, H_A: [B, L_*, 256]. labels: [B, 1] regression target.
+        epoch: 当前 epoch (1-based). 当 epoch 在 warmup_epochs 以内时，不更新 EMA，并返回中性先验 0.5。
+        warmup_epochs: 预热期长度 (int)。0 表示不启用预热。
         Returns r_global [B,1], s_global [B,1], aux_pid_loss scalar.
         """
         B = H_T.size(0)
         device = H_T.device
+
+        # 预热期：跳过 probe 与 MMI-PID 计算，冻结 EMA，直接使用中性先验 0.5
+        if warmup_epochs > 0 and epoch is not None and epoch <= warmup_epochs:
+            r_val = 0.5
+            s_val = 0.5
+            r_global = torch.full((B, 1), r_val, device=device, dtype=H_T.dtype)
+            s_global = torch.full((B, 1), s_val, device=device, dtype=H_T.dtype)
+            aux_pid_loss = torch.tensor(0.0, device=device)
+            return r_global, s_global, aux_pid_loss
+
+        # 非预热期：正常计算 probe 与 MMI-PID，并更新 EMA
         # Pool and detach for probe
         Z_T = H_T.mean(dim=1).detach()   # [B, 256]
         Z_A = H_A.mean(dim=1).detach()

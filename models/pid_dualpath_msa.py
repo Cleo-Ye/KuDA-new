@@ -15,6 +15,7 @@ class PIDDualPathMSA(nn.Module):
         super(PIDDualPathMSA, self).__init__()
         self.opt = opt
         self.use_batch_pid_prior = use_batch_pid_prior
+        self.pid_prior_warmup_epochs = getattr(opt, 'pid_prior_warmup_epochs', 5)
         hidden_size = getattr(opt, 'hidden_size', 256)
         dim_t, dim_v, dim_a = 768, 128, 128
 
@@ -57,7 +58,7 @@ class PIDDualPathMSA(nn.Module):
         self.aux_head_S = nn.Linear(hidden_size, 1)
         self.cls_head = nn.Linear(hidden_size, 1)
 
-    def forward(self, inputs_data_mask, multi_senti, gt_modal_labels=None):
+    def forward(self, inputs_data_mask, multi_senti, gt_modal_labels=None, epoch=None, tau_evidence=None, tau_router=None):
         device = next(self.parameters()).device
         # 1. Unimodal encoder (no mean(1))
         uni_fea, uni_senti, posteriors, senti_scores = self.UniEncKI(inputs_data_mask)
@@ -68,17 +69,22 @@ class PIDDualPathMSA(nn.Module):
         # 2. Feature alignment
         H_T, H_V, H_A = self.aligner(H_T_raw, H_V_raw, H_A_raw)   # [B, L_*, 256]
 
-        # 3. Batch PID prior (Phase 1: skip, use fixed 0.5)
+        # 3. Batch PID prior
         if self.batch_pid_prior is not None and multi_senti is not None:
-            r_global, s_global, aux_pid_loss = self.batch_pid_prior(H_T, H_V, H_A, multi_senti)
+            r_global, s_global, aux_pid_loss = self.batch_pid_prior(
+                H_T, H_V, H_A, multi_senti,
+                epoch=epoch,
+                warmup_epochs=self.pid_prior_warmup_epochs,
+            )
         else:
             B = H_T.size(0)
             r_global = torch.full((B, 1), 0.5, device=device, dtype=H_T.dtype)
             s_global = torch.full((B, 1), 0.5, device=device, dtype=H_T.dtype)
             aux_pid_loss = torch.tensor(0.0, device=device)
 
-        # 4. Sample evidence proxy
-        q_r, q_s, e_scores = self.sample_proxy(H_T, H_A, H_V)
+        # 4. Sample evidence proxy（支持温度缩放）
+        tau_evi = 1.0 if tau_evidence is None else float(tau_evidence)
+        q_r, q_s, e_scores = self.sample_proxy(H_T, H_A, H_V, tau=tau_evi)
 
         # 4.5 构建 padding mask：数据集中 True=padding，转为 1=有效、0=padding
         B, len_t, len_v, len_a = H_T.size(0), H_T.size(1), H_V.size(1), H_A.size(1)

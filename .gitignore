@@ -163,6 +163,7 @@ cython_debug/
 
 # KuDA 本地/大文件，不提交
 /checkpoints/
+.tmp/
 /data/
 /docs/
 /log/

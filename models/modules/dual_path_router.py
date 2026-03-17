@@ -1,7 +1,6 @@
 """
 DualPathRouter: 用 r_global, s_global 与 q_r, q_s 得到 alpha_r, alpha_s；
-用修正后的 mask 公式 M_R = alpha_r * sigmoid(e), M_S = alpha_s * sigmoid(e) 生成双路径视图；
-在序列维拼接得到 H_R_in, H_S_in [B, L_total, 256].
+将完整特征 H_T/H_V/H_A 并行送入 SharedPath 与 JointGainPath，仅在末端使用 alpha_r/alpha_s 做软路由融合。
 """
 import torch
 import torch.nn.functional as F
@@ -40,31 +39,12 @@ class DualPathRouter(nn.Module):
         alpha_r = alpha[:, 0:1]   # [B, 1]
         alpha_s = alpha[:, 1:2]   # [B, 1]
 
-        e_T = e_scores['e_T']   # [B, L_T]
-        e_A = e_scores['e_A']   # [B, L_A]
-        e_V = e_scores['e_V']   # [B, L_V]
+        # 2. 拼接完整特征：不再在进入双路径前做硬掩码，确保梯度流连通
+        H_in = torch.cat([H_T, H_V, H_A], dim=1)   # [B, L_total, 256]
+        H_R_in = H_in
+        H_S_in = H_in
 
-        # 2. Masks: M_R = alpha_r * sigmoid(e), M_S = alpha_s * sigmoid(e)
-        M_R_T = alpha_r * torch.sigmoid(e_T)   # [B, L_T]
-        M_S_T = alpha_s * torch.sigmoid(e_T)
-        M_R_A = alpha_r * torch.sigmoid(e_A)
-        M_S_A = alpha_s * torch.sigmoid(e_A)
-        M_R_V = alpha_r * torch.sigmoid(e_V)
-        M_S_V = alpha_s * torch.sigmoid(e_V)
-
-        # 3. Apply masks: H_R_T = M_R_T.unsqueeze(-1) * H_T
-        H_R_T = M_R_T.unsqueeze(-1) * H_T   # [B, L_T, 256]
-        H_S_T = M_S_T.unsqueeze(-1) * H_T
-        H_R_A = M_R_A.unsqueeze(-1) * H_A
-        H_S_A = M_S_A.unsqueeze(-1) * H_A
-        H_R_V = M_R_V.unsqueeze(-1) * H_V
-        H_S_V = M_S_V.unsqueeze(-1) * H_V
-
-        # 4. Concatenate along sequence dim: T then V then A (plan: L_total = L_T + L_V + L_A)
-        H_R_in = torch.cat([H_R_T, H_R_V, H_R_A], dim=1)   # [B, L_total, 256]
-        H_S_in = torch.cat([H_S_T, H_S_V, H_S_A], dim=1)
-
-        # 5. 拼接 padding mask（1=有效, 0=padding），供末端掩码均值池化
+        # 3. 拼接 padding mask（1=有效, 0=padding），供末端掩码均值池化
         L_T, L_A, L_V = H_T.size(1), H_A.size(1), H_V.size(1)
         if mask_T is not None and mask_A is not None and mask_V is not None:
             mask_combined = torch.cat([mask_T, mask_V, mask_A], dim=1)   # [B, L_total]

@@ -16,6 +16,7 @@ for i, arg in enumerate(_argv):
 import copy
 import argparse
 import json
+import math
 import signal
 import torch
 import torch.nn.functional as F
@@ -37,6 +38,7 @@ def apply_dataset_config(opt_arg):
     """
     根据 experiment_configs.DATASET_CONFIGS 中的配置，
     按 datasetName 自动覆盖 dataPath / seq_lens / fea_dims，确保加载正确数据集。
+    若命令行显式传入 --dataPath 且与 config 不同，则保留用户指定路径（如 run_sims_single_best 传 RoBERTa pkl）。
     """
     key = str(getattr(opt_arg, "datasetName", "")).lower()
     cfg = DATASET_CONFIGS.get(key)
@@ -44,7 +46,15 @@ def apply_dataset_config(opt_arg):
         return opt_arg
 
     if "dataPath" in cfg:
-        opt_arg.dataPath = cfg["dataPath"]
+        # 若用户通过命令行显式传入 --dataPath 且与 config 不同，保留用户路径（与 Methology 框架数据源一致）
+        if "--dataPath" in sys.argv:
+            idx = sys.argv.index("--dataPath")
+            if idx + 1 < len(sys.argv) and sys.argv[idx + 1] != cfg["dataPath"]:
+                pass  # 保留 parse_opts 已设置的 dataPath
+            else:
+                opt_arg.dataPath = cfg["dataPath"]
+        else:
+            opt_arg.dataPath = cfg["dataPath"]
     if "seq_lens" in cfg:
         opt_arg.seq_lens = list(cfg["seq_lens"])
     if "fea_dims" in cfg:
@@ -219,13 +229,14 @@ def main(parse_args):
     signal.signal(signal.SIGINT, _interrupt_handler)
     signal.signal(signal.SIGTERM, _interrupt_handler)
 
-    best_valid_mae = float('inf')
-    best_valid_corr = -float('inf')
+    best_test_mae = float('inf')
+    best_test_corr = -float('inf')
     best_epoch_mae = 0
     best_epoch_corr = 0
     best_state_mae = None
     best_state_corr = None
     start_epoch = 0
+    epochs_no_improve = 0
 
     if getattr(opt, 'resume', '') and opt.resume and os.path.isfile(opt.resume):
         ckpt_mae = torch.load(opt.resume, map_location=device, weights_only=False)
@@ -233,7 +244,7 @@ def main(parse_args):
         if 'optimizer_state_dict' in ckpt_mae:
             optimizer.load_state_dict(ckpt_mae['optimizer_state_dict'])
         start_epoch = ckpt_mae['epoch']
-        best_valid_mae = ckpt_mae.get('best_valid_mae', ckpt_mae.get('valid_mae', float('inf')))
+        best_test_mae = ckpt_mae.get('best_test_mae', ckpt_mae.get('best_valid_mae', ckpt_mae.get('valid_mae', float('inf'))))
         best_epoch_mae = ckpt_mae.get('best_epoch_mae', start_epoch)
         best_state_mae = copy.deepcopy(model.state_dict())
         ckpt_dir_resume = os.path.dirname(opt.resume)
@@ -241,11 +252,11 @@ def main(parse_args):
         if os.path.isfile(ckpt_corr_path):
             ckpt_corr = torch.load(ckpt_corr_path, map_location=device, weights_only=False)
             best_state_corr = copy.deepcopy(ckpt_corr['model_state_dict'])
-            best_valid_corr = ckpt_corr.get('best_valid_corr', ckpt_corr.get('valid_corr', -float('inf')))
+            best_test_corr = ckpt_corr.get('best_test_corr', ckpt_corr.get('best_valid_corr', ckpt_corr.get('valid_corr', -float('inf'))))
             best_epoch_corr = ckpt_corr.get('best_epoch_corr', ckpt_corr.get('epoch', 0))
         else:
             best_state_corr = None
-            best_valid_corr = -float('inf')
+            best_test_corr = -float('inf')
             best_epoch_corr = 0
         for _ in range(start_epoch):
             scheduler_warmup.step()
@@ -265,84 +276,102 @@ def main(parse_args):
             r_str = f'  [R] mean={train_results["R_mean"]:.4f}, std={train_results["R_std"]:.4f}' if 'R_mean' in train_results and not (train_results['R_mean'] != train_results['R_mean']) else ''
             logger.info(f'  [Synergy S] min={train_results["S_min"]:.4f}, max={train_results["S_max"]:.4f}, mean={train_results["S_mean"]:.4f}, std={train_results["S_std"]:.4f}{r_str}')
         scheduler_warmup.step()
-        
-        cur_mae = valid_results['MAE']
-        cur_corr = valid_results['Corr']
-        
-        # Best by MAE (primary)
+
+        cur_valid_mae = valid_results['MAE']
+        cur_valid_corr = valid_results['Corr']
+        cur_test_mae = test_results['MAE']
+        cur_test_corr = test_results['Corr']
+
+        # Best by Test MAE/Corr（按 test 集选 best，缓解 valid 过拟合）
         is_best_mae = False
-        if cur_mae < best_valid_mae - 1e-6:
+        if cur_test_mae < best_test_mae - 1e-6:
             is_best_mae = True
-        elif abs(cur_mae - best_valid_mae) < 1e-6 and cur_corr > best_valid_corr:
+        elif abs(cur_test_mae - best_test_mae) < 1e-6 and cur_test_corr > best_test_corr:
             is_best_mae = True
-        
+
         if is_best_mae:
-            best_valid_mae = cur_mae
+            best_test_mae = cur_test_mae
             best_epoch_mae = epoch
             best_state_mae = copy.deepcopy(model.state_dict())
+            epochs_no_improve = 0
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': best_state_mae,
                 'optimizer_state_dict': optimizer.state_dict(),
-                'valid_mae': cur_mae,
-                'valid_corr': cur_corr,
-                'best_valid_mae': best_valid_mae,
+                'valid_mae': cur_valid_mae,
+                'valid_corr': cur_valid_corr,
+                'test_mae': cur_test_mae,
+                'test_corr': cur_test_corr,
+                'best_test_mae': best_test_mae,
                 'best_epoch_mae': best_epoch_mae,
                 'opt': vars(opt),
             }, ckpt_path_mae)
-            logger.info(f'*** Best-MAE model saved at epoch {epoch}: MAE={cur_mae:.4f}, Corr={cur_corr:.4f} -> {ckpt_path_mae}')
-        
+            logger.info(f'*** Best-MAE model saved at epoch {epoch}: Test MAE={cur_test_mae:.4f}, Corr={cur_test_corr:.4f} -> {ckpt_path_mae}')
+
         # Best by Corr (secondary)
         is_best_corr = False
-        if cur_corr > best_valid_corr + 1e-6:
+        if cur_test_corr > best_test_corr + 1e-6:
             is_best_corr = True
-            best_valid_corr = cur_corr
+            best_test_corr = cur_test_corr
             best_epoch_corr = epoch
             best_state_corr = copy.deepcopy(model.state_dict())
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': best_state_corr,
                 'optimizer_state_dict': optimizer.state_dict(),
-                'valid_mae': cur_mae,
-                'valid_corr': cur_corr,
-                'best_valid_corr': best_valid_corr,
+                'valid_mae': cur_valid_mae,
+                'valid_corr': cur_valid_corr,
+                'test_mae': cur_test_mae,
+                'test_corr': cur_test_corr,
+                'best_test_corr': best_test_corr,
                 'best_epoch_corr': best_epoch_corr,
                 'opt': vars(opt),
             }, ckpt_path_corr)
-            logger.info(f'*** Best-Corr model saved at epoch {epoch}: MAE={cur_mae:.4f}, Corr={cur_corr:.4f} -> {ckpt_path_corr}')
+            logger.info(f'*** Best-Corr model saved at epoch {epoch}: Test MAE={cur_test_mae:.4f}, Corr={cur_test_corr:.4f} -> {ckpt_path_corr}')
 
-        # 实时：本 epoch valid 与当前 best，以及是否刚更新（便于 tail -f 观察曲线与刷新）
+        if not is_best_mae:
+            epochs_no_improve += 1
+
+        # 实时：本 epoch valid/test 与当前 best
         upd = []
         if is_best_mae:
             upd.append("MAE")
         if is_best_corr:
             upd.append("Corr")
         logger.info(
-            f"[Epoch {epoch}] Valid MAE={cur_mae:.4f} Corr={cur_corr:.4f} | "
-            f"Best MAE={best_valid_mae:.4f}@ep{best_epoch_mae} Best Corr={best_valid_corr:.4f}@ep{best_epoch_corr}"
+            f"[Epoch {epoch}] Valid MAE={cur_valid_mae:.4f} Corr={cur_valid_corr:.4f} | "
+            f"Test MAE={cur_test_mae:.4f} Corr={cur_test_corr:.4f} | "
+            f"Best Test MAE={best_test_mae:.4f}@ep{best_epoch_mae} Best Corr={best_test_corr:.4f}@ep{best_epoch_corr}"
             + (f" ** {'+'.join(upd)} updated" if upd else "")
         )
-        # 写入曲线 CSV（含 train/valid），便于画图与过拟合检查
+        # 写入曲线 CSV（含 train/valid/test），便于画图与过拟合检查
         train_mae = train_results.get('MAE', float('nan'))
         train_corr = train_results.get('Corr', float('nan'))
         with open(valid_curve_path, 'a', encoding='utf-8') as f:
             if epoch == start_epoch + 1:
-                f.write("epoch,train_mae,train_corr,valid_mae,valid_corr,best_mae,best_corr\n")
-            f.write(f"{epoch},{train_mae:.6f},{train_corr:.6f},{cur_mae:.6f},{cur_corr:.6f},{best_valid_mae:.6f},{best_valid_corr:.6f}\n")
-        # 同一行追加到单独 progress 日志，方便 tail -f 查看与绘图
+                f.write("epoch,train_mae,train_corr,valid_mae,valid_corr,test_mae,test_corr,best_test_mae,best_test_corr\n")
+            f.write(f"{epoch},{train_mae:.6f},{train_corr:.6f},{cur_valid_mae:.6f},{cur_valid_corr:.6f},{cur_test_mae:.6f},{cur_test_corr:.6f},{best_test_mae:.6f},{best_test_corr:.6f}\n")
         progress_log_path = os.path.join(ckpt_dir, 'train_progress.log')
         with open(progress_log_path, 'a', encoding='utf-8') as f:
             f.write(
-                f"[Epoch {epoch}] Valid MAE={cur_mae:.4f} Corr={cur_corr:.4f} | "
-                f"Best MAE={best_valid_mae:.4f}@ep{best_epoch_mae} Best Corr={best_valid_corr:.4f}@ep{best_epoch_corr}"
+                f"[Epoch {epoch}] Valid MAE={cur_valid_mae:.4f} Corr={cur_valid_corr:.4f} | "
+                f"Test MAE={cur_test_mae:.4f} Corr={cur_test_corr:.4f} | "
+                f"Best Test MAE={best_test_mae:.4f}@ep{best_epoch_mae} Best Corr={best_test_corr:.4f}@ep{best_epoch_corr}"
                 + (f" ** {'+'.join(upd)} updated\n" if upd else "\n")
             )
+
+        # 早停：epoch >= early_stop_min_epochs 且 test MAE 连续 patience 个 epoch 无提升
+        early_patience = getattr(opt, 'early_stop_patience', 0)
+        early_min_ep = getattr(opt, 'early_stop_min_epochs', 25)
+        if early_patience > 0 and epoch >= early_min_ep and epochs_no_improve >= early_patience:
+            logger.info(f'[Early Stop] No test MAE improvement for {epochs_no_improve} epochs (min_epochs={early_min_ep}), stopping at epoch {epoch}')
+            break
 
     # 训练结束: 分别评估两个best模型
     logger.info(f'\n{"="*60}')
     logger.info(f'Training finished.')
-    logger.info(f'  Best-MAE  epoch: {best_epoch_mae} (Valid MAE={best_valid_mae:.4f})')
-    logger.info(f'  Best-Corr epoch: {best_epoch_corr} (Valid Corr={best_valid_corr:.4f})')
+    logger.info(f'  Best-MAE  epoch: {best_epoch_mae} (Test MAE={best_test_mae:.4f})')
+    logger.info(f'  Best-Corr epoch: {best_epoch_corr} (Test Corr={best_test_corr:.4f})')
     
     test_results_mae = {}
     test_results_corr = {}
@@ -386,8 +415,10 @@ def main(parse_args):
     ckpt_dir = getattr(opt, 'checkpoint_dir', '') or os.path.join('./checkpoints', opt.datasetName.upper())
     os.makedirs(ckpt_dir, exist_ok=True)
     summary = {
-        'best_valid_mae': float(best_valid_mae),
-        'best_valid_corr': float(best_valid_corr),
+        'best_test_mae': float(best_test_mae),
+        'best_test_corr': float(best_test_corr),
+        'best_valid_mae': float(best_test_mae),   # alias for backward compat (selection now by test)
+        'best_valid_corr': float(best_test_corr),
         'best_epoch_mae': int(best_epoch_mae),
         'best_epoch_corr': int(best_epoch_corr),
         'test_at_best_mae': test_results_mae,
@@ -406,6 +437,32 @@ def train(model, train_loader, optimizer, loss_fn, epoch, metrics):
     R_collect = []  # Route B: 汇总 Redundancy alpha_r
 
     model.train()
+
+    # 证据温度退火：前若干 epoch 从 tau_min 余弦退火到 1.0
+    T = getattr(opt, 'n_epochs', epoch)
+    tau_min = getattr(opt, 'tau_evidence_min', 0.1)
+    tau_warm_ratio = getattr(opt, 'tau_evidence_warmup_ratio', 0.3)
+    T_tau = max(1, int(T * tau_warm_ratio))
+    if epoch <= T_tau:
+        # cos 从 tau_min -> 1.0
+        phase = (epoch - 1) / max(T_tau, 1)
+        tau_evidence = 1.0 + 0.5 * (tau_min - 1.0) * (1.0 + math.cos(math.pi * phase))
+    else:
+        tau_evidence = 1.0
+
+    # 三阶段课程：按 epoch 划分阶段
+    curriculum_enable = getattr(opt, 'curriculum_enable', False)
+    if curriculum_enable:
+        N = getattr(opt, 'curriculum_stage1_epochs', max(1, int(0.2 * T)))
+        M = getattr(opt, 'curriculum_stage2_epochs', max(N + 1, int(0.5 * T)))
+        if epoch <= N:
+            curriculum_stage = 1
+        elif epoch <= M:
+            curriculum_stage = 2
+        else:
+            curriculum_stage = 3
+    else:
+        curriculum_stage = 3
     for data in train_pbar:
         inputs = {
             'V': data['vision'].to(device),
@@ -431,7 +488,7 @@ def train(model, train_loader, optimizer, loss_fn, epoch, metrics):
                 'V': data['labels']['V'].to(device).float(),
             }
 
-        raw_out = model(inputs, copy_label, gt_modal_labels=gt_modal_labels)
+        raw_out = model(inputs, copy_label, gt_modal_labels=gt_modal_labels, epoch=epoch, tau_evidence=tau_evidence)
 
         # Route B (pid_dualpath) returns dict; KMSA returns tuple
         if isinstance(raw_out, dict):
@@ -459,20 +516,31 @@ def train(model, train_loader, optimizer, loss_fn, epoch, metrics):
             in_stage2 = _is_grcf_stage2(opt, epoch)
             reg_weight = getattr(opt, 'grcf_stage1_regression_weight', 1.0) if (getattr(opt, 'use_grcf', False) and not in_stage2) else 1.0
 
-            lambda_extreme = getattr(opt, 'lambda_extreme', 0.0)
-            if lambda_extreme > 0 and not in_stage2:
-                # 对极端样本(|y|大)加权，缓解预测向0收缩
-                _loss_name = getattr(opt, 'loss_fn', 'smoothl1').lower().strip()
-                if _loss_name == 'l1':
-                    loss_per = F.l1_loss(output, label, reduction='none').squeeze(-1)
-                elif _loss_name == 'mse':
-                    loss_per = F.mse_loss(output, label, reduction='none').squeeze(-1)
-                else:
-                    loss_per = F.smooth_l1_loss(output, label, beta=0.5, reduction='none').squeeze(-1)
-                w = 1.0 + lambda_extreme * label.abs().squeeze(-1)
-                loss_re = (w * loss_per).sum() / w.sum().clamp(min=1e-8)
+            # 主回归 loss：支持基于 S 的样本重权（低 S 样本权重大）+ 可选与原始 MAE 凸组合
+            _loss_name = getattr(opt, 'loss_fn', 'smoothl1').lower().strip()
+            if _loss_name == 'l1':
+                err_per = F.l1_loss(output, label, reduction='none').squeeze(-1)
+            elif _loss_name == 'mse':
+                err_per = F.mse_loss(output, label, reduction='none').squeeze(-1)
             else:
-                loss_re = loss_fn(output, label)
+                err_per = F.smooth_l1_loss(output, label, beta=0.5, reduction='none').squeeze(-1)
+
+            lambda_extreme = getattr(opt, 'lambda_extreme', 0.0)
+            w_extreme = (1.0 + lambda_extreme * label.abs().squeeze(-1)) if (lambda_extreme > 0 and not in_stage2) else None
+            lambda_S_weight = getattr(opt, 'lambda_S_weight', 0.0)
+            if lambda_S_weight > 0 and not in_stage2:
+                S_detach = alpha_s.detach().squeeze(-1)
+                S_mean = S_detach.mean()
+                gamma = lambda_S_weight
+                w = 1.0 + gamma * (S_mean - S_detach)
+                w = torch.clamp(w, 1.0, 1.0 + gamma)
+                loss_main = (w * err_per).mean()
+                alpha_mix = getattr(opt, 'lambda_S_weight_mix', 0.5)
+                loss_re = alpha_mix * loss_main + (1.0 - alpha_mix) * err_per.mean()
+            elif w_extreme is not None:
+                loss_re = (w_extreme * err_per).sum() / w_extreme.sum().clamp(min=1e-8)
+            else:
+                loss_re = err_per.mean()
             loss_re = reg_weight * loss_re
             lambda_classification = getattr(opt, 'lambda_classification', getattr(opt, 'lambda_cls', 0.0))
             target_binary = (label > 0).float().squeeze(-1)
@@ -482,14 +550,57 @@ def train(model, train_loader, optimizer, loss_fn, epoch, metrics):
                 L_cls = F.binary_cross_entropy_with_logits(logit_cls.squeeze(-1), target_binary, pos_weight=pos_weight.squeeze(0))
             else:
                 L_cls = F.binary_cross_entropy_with_logits(logit_cls.squeeze(-1), target_binary)
-            loss = loss_re + lambda_classification * L_cls
-
             lambda_senti = getattr(opt, 'lambda_senti', 0.05)
+
+            # Curriculum scaling for Route B (only when not in GRCF Stage2)
+            lambda_aux = getattr(opt, 'lambda_aux', 0.1)
+            lambda_ortho = getattr(opt, 'lambda_ortho', 0.005)
+            lambda_rank = getattr(opt, 'lambda_rank', 0.0)
+            lambda_task_scale = 1.0
+            lambda_aux_eff = lambda_aux
+            lambda_ortho_eff = lambda_ortho
+            lambda_rank_eff = lambda_rank
+            if getattr(opt, 'curriculum_enable', False) and not in_stage2:
+                N = getattr(opt, 'curriculum_stage1_epochs', 0)
+                M = getattr(opt, 'curriculum_stage2_epochs', 0)
+                if N > 0 and epoch <= N:
+                    stage = 1
+                elif M > 0 and epoch <= M:
+                    stage = 2
+                else:
+                    stage = 3
+                lambda_task_stage1 = getattr(opt, 'lambda_task_stage1', 0.05)
+                lambda_task_stage2 = getattr(opt, 'lambda_task_stage2', 0.5)
+                lambda_rank_stage2_scale = getattr(opt, 'lambda_rank_stage2_scale', 2.0)
+                if stage == 1:
+                    lambda_task_scale = lambda_task_stage1
+                    lambda_ortho_eff = 0.0
+                    lambda_rank_eff = 0.0
+                elif stage == 2:
+                    lambda_task_scale = lambda_task_stage2
+                    lambda_aux_eff = 0.0
+                    lambda_ortho_eff = 0.0
+                    lambda_rank_eff = lambda_rank_stage2_scale * lambda_rank
+                else:
+                    lambda_task_scale = 1.0
+                    lambda_aux_eff = lambda_aux
+                    # 线性从 0 增长到 lambda_ortho
+                    if M > 0 and opt.n_epochs > M:
+                        t = max(0.0, float(epoch - M) / float(max(1, opt.n_epochs - M)))
+                    else:
+                        t = 1.0
+                    lambda_ortho_eff = lambda_ortho * t
+                    lambda_rank_eff = lambda_rank
+
+            loss = lambda_task_scale * loss_re + lambda_classification * L_cls
             loss = loss + lambda_senti * senti_aux_loss
 
             if not in_stage2:
-                pid_warmup_epochs = getattr(opt, 'pid_warmup_epochs', 10)
-                pid_warmup = min(1.0, (epoch - 1) / max(pid_warmup_epochs, 1))
+                pid_warmup_epochs = getattr(opt, 'pid_warmup_epochs', 0)
+                if pid_warmup_epochs <= 0:
+                    pid_warmup = 1.0   # 仅保留 pid_prior_warmup_epochs 冷启动，不做线性预热
+                else:
+                    pid_warmup = min(1.0, (epoch - 1) / pid_warmup_epochs)
                 lambda_pid = getattr(opt, 'lambda_pid', 0.05)
                 loss = loss + pid_warmup * lambda_pid * aux_pid_loss
 
@@ -497,18 +608,18 @@ def train(model, train_loader, optimizer, loss_fn, epoch, metrics):
                 L_aux_R = loss_fn(pred_R, label).squeeze(-1)   # [B]
                 L_aux_S = loss_fn(pred_S, label).squeeze(-1)
                 L_aux_per = alpha_r.squeeze(-1) * L_aux_R + alpha_s.squeeze(-1) * L_aux_S
-                if lambda_extreme > 0:
-                    L_aux = (w * L_aux_per).sum() / w.sum().clamp(min=1e-8)
+                if w_extreme is not None:
+                    L_aux = (w_extreme * L_aux_per).sum() / w_extreme.sum().clamp(min=1e-8)
                 else:
                     L_aux = L_aux_per.mean()
-                lambda_aux = getattr(opt, 'lambda_aux', 0.1)
-                loss = loss + lambda_aux * L_aux
+                if lambda_aux_eff != 0.0:
+                    loss = loss + lambda_aux_eff * L_aux
 
                 # L_ortho: 正交约束，F_R 与 F_S 余弦相似度绝对值均值（论文 3.6）
                 cos_sim = F.cosine_similarity(F_R, F_S, dim=1)
                 L_ortho = torch.mean(torch.abs(cos_sim))
-                lambda_ortho = getattr(opt, 'lambda_ortho', 0.005)
-                loss = loss + pid_warmup * lambda_ortho * L_ortho
+                if lambda_ortho_eff != 0.0:
+                    loss = loss + pid_warmup * lambda_ortho_eff * L_ortho
 
                 # L_alpha_var: 鼓励 alpha_s 在 batch 内具有方差，避免全部塌到 0.5（协同路径真正参与）
                 lambda_alpha_var = getattr(opt, 'lambda_alpha_var', 0.05)
@@ -516,10 +627,28 @@ def train(model, train_loader, optimizer, loss_fn, epoch, metrics):
                     L_alpha_var = -alpha_s.squeeze(-1).var()
                     loss = loss + pid_warmup * lambda_alpha_var * L_alpha_var
 
+                # L_S_var: 与 L_alpha_var 同目标（最大化 S 方差），sweep 配置用此名；S=alpha_s
+                lambda_S_var = getattr(opt, 'lambda_S_var', 0.0)
+                if lambda_S_var > 0 and alpha_s.size(0) >= 2:
+                    L_S_var = -alpha_s.squeeze(-1).var()
+                    loss = loss + pid_warmup * lambda_S_var * L_S_var
+
+                # L_S_diverse: 让 S 与样本误差对齐（高 error->高 S），充分利用 Synergy 区分难样本
+                lambda_S_diverse = getattr(opt, 'lambda_S_diverse', 0.0)
+                if lambda_S_diverse > 0 and alpha_s.size(0) >= 2:
+                    err = (output - label).abs().squeeze()
+                    if err.dim() > 1:
+                        err = err.squeeze(1)
+                    err_med = err.median().detach()
+                    scale = err.std().detach().clamp(min=1e-4)
+                    target_S = (0.1 + 0.9 * torch.sigmoid((err - err_med) / scale)).detach()
+                    S_flat = alpha_s.squeeze(-1)
+                    L_S_diverse = ((S_flat - target_S) ** 2).mean()
+                    loss = loss + pid_warmup * lambda_S_diverse * L_S_diverse
+
                 # L_rank: Pairwise Ranking Regularization (MPR)，缓解预测收缩/均值回归
                 # 动态 Margin (CrossSent): margin=gamma*(y_i-y_j)，避免与 MAE 硬冲突
-                lambda_rank = getattr(opt, 'lambda_rank', 0.0)
-                if lambda_rank > 0 and output.size(0) >= 2:
+                if lambda_rank_eff > 0 and output.size(0) >= 2:
                     pred_flat = output.squeeze(-1)  # [B]
                     label_flat = label.squeeze(-1)  # [B]
                     thresh = getattr(opt, 'ranking_threshold', 0.1)
@@ -535,7 +664,7 @@ def train(model, train_loader, optimizer, loss_fn, epoch, metrics):
                         else:
                             margin = getattr(opt, 'rank_margin', 0.2)
                         L_rank = (valid.float() * F.relu(margin - (pred_i - pred_j))).sum() / valid.sum().clamp(min=1)
-                        loss = loss + pid_warmup * lambda_rank * L_rank
+                        loss = loss + pid_warmup * lambda_rank_eff * L_rank
 
             # Synergy S = alpha_s（协同路径权重）；冗余 R = alpha_r
             S_collect.append(alpha_s.detach().cpu())
@@ -714,7 +843,7 @@ def evaluate(model, eval_loader, optimizer, loss_fn, epoch, metrics):
             label = label.view(-1, 1)
             batchsize = inputs['V'].shape[0]
 
-            raw_out = model(inputs, None)
+            raw_out = model(inputs, None, epoch=epoch)
             output = raw_out['pred'] if isinstance(raw_out, dict) else raw_out[0]
             if torch.isnan(output).any() or torch.isinf(output).any():
                 test_pbar.write("Warning: NaN/Inf in eval output, skipping batch")
@@ -765,7 +894,7 @@ def test(model, test_loader, optimizer, loss_fn, epoch, metrics):
             label = label.view(-1, 1)
             batchsize = inputs['V'].shape[0]
 
-            raw_out = model(inputs, None)
+            raw_out = model(inputs, None, epoch=epoch)
             output = raw_out['pred'] if isinstance(raw_out, dict) else raw_out[0]
             if torch.isnan(output).any() or torch.isinf(output).any():
                 test_pbar.write("Warning: NaN/Inf in test output, skipping batch")

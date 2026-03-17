@@ -18,7 +18,7 @@ class SampleEvidenceProxy(nn.Module):
         self.score_A = nn.Linear(hidden_dim, 1)
         self.score_V = nn.Linear(hidden_dim, 1)
 
-    def forward(self, H_T, H_A, H_V):
+    def forward(self, H_T, H_A, H_V, tau=None):
         """
         H_T: [B, L_T, 256], H_A: [B, L_A, 256], H_V: [B, L_V, 256]
         Returns q_r [B,1], q_s [B,1], e_scores dict
@@ -28,6 +28,7 @@ class SampleEvidenceProxy(nn.Module):
         _, L_V, _ = H_V.shape
         device = H_T.device
         eps = 1e-8
+        tau = float(tau) if tau is not None else 1.0
 
         # 1. Evidence logits per token
         e_T = self.score_T(H_T).squeeze(-1)   # [B, L_T]
@@ -35,9 +36,9 @@ class SampleEvidenceProxy(nn.Module):
         e_V = self.score_V(H_V).squeeze(-1)   # [B, L_V]
 
         # 2. Evidence distribution (softmax over sequence)
-        pi_T = F.softmax(e_T, dim=1)   # [B, L_T]
-        pi_A = F.softmax(e_A, dim=1)   # [B, L_A]
-        pi_V = F.softmax(e_V, dim=1)   # [B, L_V]
+        pi_T = F.softmax(e_T / tau, dim=1)   # [B, L_T]
+        pi_A = F.softmax(e_A / tau, dim=1)   # [B, L_A]
+        pi_V = F.softmax(e_V / tau, dim=1)   # [B, L_V]
 
         # 3. Evidence center: weighted sum of features
         hbar_T = (pi_T.unsqueeze(-1) * H_T).sum(dim=1)   # [B, 256]
