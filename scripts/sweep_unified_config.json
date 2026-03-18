@@ -1,0 +1,17 @@
+{
+  "_comment": "一、四、七 三部分参数。只列出要 sweep 的 param，value 为候选列表。未列出的用默认单值。网格过大时用 --max_configs 64 随机采样。",
+  "lr": [5e-5, 2e-5, 5e-6, 1e-6],
+  "bert_lr": [1e-5, 2e-5],
+  "batch_size": [16, 32],
+  "seed": [1111, 2024],
+  "path_layers": [2, 3],
+  "lambda_aux": [0.05, 0.1],
+  "lambda_ortho": [0.0025, 0.005],
+  "lambda_rank": [0.05, 0.1],
+  "lambda_pid": [0.2, 0.3],
+  "lambda_classification": [0.3, 0.35],
+  "lambda_task_stage1": [0.05, 0.08],
+  "lambda_task_stage2": [0.5, 0.7],
+  "loss_fn": ["smoothl1", "l1"],
+  "grad_clip": [0.5, 1.0]
+}

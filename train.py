@@ -294,19 +294,20 @@ def main(parse_args):
             best_epoch_mae = epoch
             best_state_mae = copy.deepcopy(model.state_dict())
             epochs_no_improve = 0
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': best_state_mae,
-                'optimizer_state_dict': optimizer.state_dict(),
-                'valid_mae': cur_valid_mae,
-                'valid_corr': cur_valid_corr,
-                'test_mae': cur_test_mae,
-                'test_corr': cur_test_corr,
-                'best_test_mae': best_test_mae,
-                'best_epoch_mae': best_epoch_mae,
-                'opt': vars(opt),
-            }, ckpt_path_mae)
-            logger.info(f'*** Best-MAE model saved at epoch {epoch}: Test MAE={cur_test_mae:.4f}, Corr={cur_test_corr:.4f} -> {ckpt_path_mae}')
+            if not getattr(opt, 'no_save_model', False):
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': best_state_mae,
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'valid_mae': cur_valid_mae,
+                    'valid_corr': cur_valid_corr,
+                    'test_mae': cur_test_mae,
+                    'test_corr': cur_test_corr,
+                    'best_test_mae': best_test_mae,
+                    'best_epoch_mae': best_epoch_mae,
+                    'opt': vars(opt),
+                }, ckpt_path_mae)
+                logger.info(f'*** Best-MAE model saved at epoch {epoch}: Test MAE={cur_test_mae:.4f}, Corr={cur_test_corr:.4f} -> {ckpt_path_mae}')
 
         # Best by Corr (secondary)
         is_best_corr = False
@@ -315,19 +316,20 @@ def main(parse_args):
             best_test_corr = cur_test_corr
             best_epoch_corr = epoch
             best_state_corr = copy.deepcopy(model.state_dict())
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': best_state_corr,
-                'optimizer_state_dict': optimizer.state_dict(),
-                'valid_mae': cur_valid_mae,
-                'valid_corr': cur_valid_corr,
-                'test_mae': cur_test_mae,
-                'test_corr': cur_test_corr,
-                'best_test_corr': best_test_corr,
-                'best_epoch_corr': best_epoch_corr,
-                'opt': vars(opt),
-            }, ckpt_path_corr)
-            logger.info(f'*** Best-Corr model saved at epoch {epoch}: Test MAE={cur_test_mae:.4f}, Corr={cur_test_corr:.4f} -> {ckpt_path_corr}')
+            if not getattr(opt, 'no_save_model', False):
+                torch.save({
+                    'epoch': epoch,
+                    'model_state_dict': best_state_corr,
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'valid_mae': cur_valid_mae,
+                    'valid_corr': cur_valid_corr,
+                    'test_mae': cur_test_mae,
+                    'test_corr': cur_test_corr,
+                    'best_test_corr': best_test_corr,
+                    'best_epoch_corr': best_epoch_corr,
+                    'opt': vars(opt),
+                }, ckpt_path_corr)
+                logger.info(f'*** Best-Corr model saved at epoch {epoch}: Test MAE={cur_test_mae:.4f}, Corr={cur_test_corr:.4f} -> {ckpt_path_corr}')
 
         if not is_best_mae:
             epochs_no_improve += 1
@@ -582,7 +584,13 @@ def train(model, train_loader, optimizer, loss_fn, epoch, metrics):
                     lambda_ortho_eff = 0.0
                     lambda_rank_eff = lambda_rank_stage2_scale * lambda_rank
                 else:
-                    lambda_task_scale = 1.0
+                    # 阶段三：MAE 权重平滑过渡，避免瞬间拉到 1.0 破坏泛化
+                    ramp_epochs = getattr(opt, 'curriculum_stage3_ramp_epochs', 0)
+                    if ramp_epochs > 0 and epoch <= M + ramp_epochs:
+                        t = float(epoch - M) / float(ramp_epochs)
+                        lambda_task_scale = lambda_task_stage2 + (1.0 - lambda_task_stage2) * t
+                    else:
+                        lambda_task_scale = 1.0
                     lambda_aux_eff = lambda_aux
                     # 线性从 0 增长到 lambda_ortho
                     if M > 0 and opt.n_epochs > M:
@@ -615,9 +623,13 @@ def train(model, train_loader, optimizer, loss_fn, epoch, metrics):
                 if lambda_aux_eff != 0.0:
                     loss = loss + lambda_aux_eff * L_aux
 
-                # L_ortho: 正交约束，F_R 与 F_S 余弦相似度绝对值均值（论文 3.6）
+                # L_ortho: 正交约束，带截断机制防止过度解耦（|cos_sim|>ε 才惩罚）
                 cos_sim = F.cosine_similarity(F_R, F_S, dim=1)
-                L_ortho = torch.mean(torch.abs(cos_sim))
+                ortho_eps = getattr(opt, 'ortho_epsilon', 0.0)
+                if ortho_eps > 0:
+                    L_ortho = torch.mean(torch.clamp(torch.abs(cos_sim) - ortho_eps, min=0.0))
+                else:
+                    L_ortho = torch.mean(torch.abs(cos_sim))
                 if lambda_ortho_eff != 0.0:
                     loss = loss + pid_warmup * lambda_ortho_eff * L_ortho
 

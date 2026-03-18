@@ -1,0 +1,8 @@
+{
+  "_comment": "小规模：4*2*2*2*2 = 64 组 configs",
+  "lr": [5e-5, 2e-5, 5e-6, 1e-6],
+  "batch_size": [16, 32],
+  "seed": [1111, 2024],
+  "path_layers": [2, 3],
+  "loss_fn": ["smoothl1", "l1"]
+}

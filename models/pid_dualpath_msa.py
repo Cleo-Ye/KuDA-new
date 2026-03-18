@@ -47,11 +47,15 @@ class PIDDualPathMSA(nn.Module):
             return_pairwise_debug=getattr(opt, 'return_pairwise_debug', False),
         )
         self.return_pairwise_debug = getattr(opt, 'return_pairwise_debug', False)
+        head_dropout = getattr(opt, 'head_dropout', 0.4)
+        self.fusion_dropout = nn.Dropout(getattr(opt, 'fusion_dropout', 0.4))
         self.main_head = nn.Sequential(
             nn.Linear(hidden_size, 64),
             nn.GELU(),
+            nn.Dropout(head_dropout),
             nn.Linear(64, 32),
             nn.GELU(),
+            nn.Dropout(head_dropout),
             nn.Linear(32, 1),
         )
         self.aux_head_R = nn.Linear(hidden_size, 1)
@@ -126,8 +130,9 @@ class PIDDualPathMSA(nn.Module):
             F_S = joint_out
             pairwise_debug = None
 
-        # 7. Dynamic fusion
+        # 7. Dynamic fusion（融合点 Dropout 正则化）
         F_final = alpha_r * F_R + alpha_s * F_S
+        F_final = self.fusion_dropout(F_final)
 
         # 8. Prediction heads
         pred = self.main_head(F_final)
