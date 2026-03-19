@@ -187,8 +187,45 @@ def main(parse_args):
             other_params.append(param)
 
     pid_lr = getattr(opt, 'pid_lr', 1e-4)
-    # 构建参数组：other + pid（若有）+ bert（若未冻结且 bert_lr>0）
-    param_groups = [{'params': other_params, 'lr': opt.lr}]
+
+    def _pid_param_is_interaction(pname):
+        if pname.startswith('UniEncKI'):
+            return False
+        for key in ('aligner', 'sample_proxy', 'router', 'shared_path', 'joint_path',
+                    'main_head', 'aux_head', 'cls_head'):
+            if key in pname:
+                return True
+        return False
+
+    interaction_group_idx = None
+    if model_type == 'pid_dualpath' and other_params:
+        backbone_p, interaction_p = [], []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            is_bert = 'UniEncKI.enc_t.encoder.model' in name or 'enc_t.encoder.model' in name
+            is_pid = pid_name in name
+            if is_bert or is_pid:
+                continue
+            if _pid_param_is_interaction(name):
+                interaction_p.append(param)
+            else:
+                backbone_p.append(param)
+        if interaction_p:
+            param_groups = [
+                {'params': backbone_p, 'lr': opt.lr},
+                {'params': interaction_p, 'lr': opt.lr},
+            ]
+            interaction_group_idx = 1
+            logger.info(
+                f'pid_dualpath param groups: backbone={sum(p.numel() for p in backbone_p)} params, '
+                f'interaction+head={sum(p.numel() for p in interaction_p)} params (stage3 LR decay target)'
+            )
+        else:
+            param_groups = [{'params': other_params, 'lr': opt.lr}]
+    else:
+        param_groups = [{'params': other_params, 'lr': opt.lr}]
+
     if pid_params:
         param_groups.append({'params': pid_params, 'lr': pid_lr})
     if bert_params:
@@ -199,6 +236,19 @@ def main(parse_args):
         logger.info(f'main lr={opt.lr:.2e}  pid lr={pid_lr:.2e}  (BERT frozen)')
 
     optimizer = torch.optim.AdamW(param_groups, weight_decay=opt.weight_decay)
+    if model_type == 'pid_dualpath':
+        logger.info(
+            f'Orthogonal: lambda_ortho={getattr(opt, "lambda_ortho", 0):.4f}, '
+            f'ortho_epsilon={getattr(opt, "ortho_epsilon", 0):.2f}'
+        )
+        if float(getattr(opt, 'focal_mae_lambda', 0)) > 0:
+            logger.info(
+                f'Focal MAE (curriculum stage3): focal_mae_lambda={opt.focal_mae_lambda}'
+            )
+        if interaction_group_idx is not None and getattr(opt, 'stage3_interaction_lr_decay', False):
+            logger.info(
+                f'Stage3 interaction LR decay: min_ratio={getattr(opt, "stage3_interaction_lr_min_ratio", 0.1)}'
+            )
 
     _loss_fn_name = getattr(opt, 'loss_fn', 'smoothl1').lower().strip()
     if _loss_fn_name == 'l1':
@@ -224,7 +274,8 @@ def main(parse_args):
     valid_curve_path = os.path.join(ckpt_dir, 'valid_curve.csv')
 
     def _interrupt_handler(sig, frame):
-        print("\n[中断] 训练已停止。当前最佳已保存在 " + ckpt_dir + " (best.pth / best_corr.pth)，可安全退出。")
+        _extra = "best.pth" + (" / best_corr.pth" if getattr(opt, "save_best_corr", True) else "")
+        print(f"\n[中断] 训练已停止。当前最佳已保存在 {ckpt_dir} ({_extra})，可安全退出。")
         sys.exit(0)
     signal.signal(signal.SIGINT, _interrupt_handler)
     signal.signal(signal.SIGTERM, _interrupt_handler)
@@ -276,6 +327,21 @@ def main(parse_args):
             r_str = f'  [R] mean={train_results["R_mean"]:.4f}, std={train_results["R_std"]:.4f}' if 'R_mean' in train_results and not (train_results['R_mean'] != train_results['R_mean']) else ''
             logger.info(f'  [Synergy S] min={train_results["S_min"]:.4f}, max={train_results["S_max"]:.4f}, mean={train_results["S_mean"]:.4f}, std={train_results["S_std"]:.4f}{r_str}')
         scheduler_warmup.step()
+        # 阶段三：交互+头参数组相对 backbone 余弦衰减 LR，减轻 test MAE 振荡
+        _Mcur = getattr(opt, 'curriculum_stage2_epochs', 0)
+        if (
+            interaction_group_idx is not None
+            and getattr(opt, 'stage3_interaction_lr_decay', False)
+            and getattr(opt, 'curriculum_enable', False)
+            and model_type == 'pid_dualpath'
+            and epoch > _Mcur
+        ):
+            min_r = float(getattr(opt, 'stage3_interaction_lr_min_ratio', 0.1))
+            span = max(1, opt.n_epochs - _Mcur)
+            t = min(1.0, float(epoch - _Mcur) / float(span))
+            decay = min_r + (1.0 - min_r) * 0.5 * (1.0 + math.cos(math.pi * t))
+            lr_back = optimizer.param_groups[0]['lr']
+            optimizer.param_groups[interaction_group_idx]['lr'] = lr_back * decay
 
         cur_valid_mae = valid_results['MAE']
         cur_valid_corr = valid_results['Corr']
@@ -309,14 +375,14 @@ def main(parse_args):
                 }, ckpt_path_mae)
                 logger.info(f'*** Best-MAE model saved at epoch {epoch}: Test MAE={cur_test_mae:.4f}, Corr={cur_test_corr:.4f} -> {ckpt_path_mae}')
 
-        # Best by Corr (secondary)
+        # Best by Corr (secondary)；save_best_corr=False 时不写盘，仅保留 best.pth
         is_best_corr = False
         if cur_test_corr > best_test_corr + 1e-6:
             is_best_corr = True
             best_test_corr = cur_test_corr
             best_epoch_corr = epoch
             best_state_corr = copy.deepcopy(model.state_dict())
-            if not getattr(opt, 'no_save_model', False):
+            if not getattr(opt, 'no_save_model', False) and getattr(opt, 'save_best_corr', True):
                 torch.save({
                     'epoch': epoch,
                     'model_state_dict': best_state_corr,
@@ -518,6 +584,17 @@ def train(model, train_loader, optimizer, loss_fn, epoch, metrics):
             in_stage2 = _is_grcf_stage2(opt, epoch)
             reg_weight = getattr(opt, 'grcf_stage1_regression_weight', 1.0) if (getattr(opt, 'use_grcf', False) and not in_stage2) else 1.0
 
+            _N = getattr(opt, 'curriculum_stage1_epochs', 0)
+            _M = getattr(opt, 'curriculum_stage2_epochs', 0)
+            curriculum_stage = 3
+            if getattr(opt, 'curriculum_enable', False) and not in_stage2:
+                if _N > 0 and epoch <= _N:
+                    curriculum_stage = 1
+                elif _M > 0 and epoch <= _M:
+                    curriculum_stage = 2
+                else:
+                    curriculum_stage = 3
+
             # 主回归 loss：支持基于 S 的样本重权（低 S 样本权重大）+ 可选与原始 MAE 凸组合
             _loss_name = getattr(opt, 'loss_fn', 'smoothl1').lower().strip()
             if _loss_name == 'l1':
@@ -529,8 +606,19 @@ def train(model, train_loader, optimizer, loss_fn, epoch, metrics):
 
             lambda_extreme = getattr(opt, 'lambda_extreme', 0.0)
             w_extreme = (1.0 + lambda_extreme * label.abs().squeeze(-1)) if (lambda_extreme > 0 and not in_stage2) else None
+            focal_lam = float(getattr(opt, 'focal_mae_lambda', 0.0))
+            use_focal_mae = (
+                focal_lam > 0
+                and not in_stage2
+                and getattr(opt, 'curriculum_enable', False)
+                and curriculum_stage == 3
+                and getattr(opt, 'focal_mae_stage3_only', True)
+            )
             lambda_S_weight = getattr(opt, 'lambda_S_weight', 0.0)
-            if lambda_S_weight > 0 and not in_stage2:
+            if use_focal_mae:
+                w_f = 1.0 + focal_lam * alpha_s.squeeze(-1).detach()
+                loss_re = (w_f * err_per).sum() / w_f.sum().clamp(min=1e-8)
+            elif lambda_S_weight > 0 and not in_stage2:
                 S_detach = alpha_s.detach().squeeze(-1)
                 S_mean = S_detach.mean()
                 gamma = lambda_S_weight
@@ -563,14 +651,8 @@ def train(model, train_loader, optimizer, loss_fn, epoch, metrics):
             lambda_ortho_eff = lambda_ortho
             lambda_rank_eff = lambda_rank
             if getattr(opt, 'curriculum_enable', False) and not in_stage2:
-                N = getattr(opt, 'curriculum_stage1_epochs', 0)
-                M = getattr(opt, 'curriculum_stage2_epochs', 0)
-                if N > 0 and epoch <= N:
-                    stage = 1
-                elif M > 0 and epoch <= M:
-                    stage = 2
-                else:
-                    stage = 3
+                N, M = _N, _M
+                stage = curriculum_stage
                 lambda_task_stage1 = getattr(opt, 'lambda_task_stage1', 0.05)
                 lambda_task_stage2 = getattr(opt, 'lambda_task_stage2', 0.5)
                 lambda_rank_stage2_scale = getattr(opt, 'lambda_rank_stage2_scale', 2.0)
